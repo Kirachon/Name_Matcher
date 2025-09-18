@@ -608,6 +608,16 @@ mod tests {
         let _ = metaphone_pct("Jos\u{00e9}", "Jose");
         let _ = metaphone_pct("M\u{00fc}ller", "Muller");
         let _ = metaphone_pct("\u{738b}\u{5c0f}\u{660e}", "Wang Xiaoming");
+    #[test]
+    fn compute_stream_cfg_bounds_and_flush() {
+        let c1 = compute_stream_cfg(512);
+        assert!(c1.batch_size >= 5_000);
+        assert!(c1.flush_every >= 1000);
+        let c2 = compute_stream_cfg(32_768);
+        assert!(c2.batch_size <= 100_000);
+        assert_eq!(c2.flush_every, (c2.batch_size as usize / 10).max(1000));
+    }
+
     }
 
 
@@ -675,6 +685,20 @@ impl Default for StreamingConfig {
         Self { batch_size: 50_000, memory_soft_min_mb: 800, flush_every: 10_000, resume: true, retry_max: 5, retry_backoff_ms: 500, checkpoint_path: None }
     }
 }
+
+/// Compute an adaptive StreamingConfig based on available memory (MB).
+/// Conservative defaults with clamped batch sizes for stability across machines.
+pub fn compute_stream_cfg(avail_mb: u64) -> StreamingConfig {
+    let mut cfg = StreamingConfig::default();
+    // Start with a conservative estimate: roughly a quarter of free RAM in rows, with clamps
+    let mut b = ((avail_mb as i64 - 1024).max(256) / 4);
+    if b < 5_000 { b = 5_000; }
+    if b > 100_000 { b = 100_000; }
+    cfg.batch_size = b;
+    cfg.flush_every = (cfg.batch_size as usize / 10).max(1000);
+    cfg
+}
+
 
 #[derive(Clone)]
 pub struct StreamControl { pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>, pub pause: std::sync::Arc<std::sync::atomic::AtomicBool> }
