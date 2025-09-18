@@ -691,7 +691,7 @@ impl Default for StreamingConfig {
 pub fn compute_stream_cfg(avail_mb: u64) -> StreamingConfig {
     let mut cfg = StreamingConfig::default();
     // Start with a conservative estimate: roughly a quarter of free RAM in rows, with clamps
-    let mut b = ((avail_mb as i64 - 1024).max(256) / 4);
+    let mut b = (avail_mb as i64 - 1024).max(256) / 4;
     if b < 5_000 { b = 5_000; }
     if b > 100_000 { b = 100_000; }
     cfg.batch_size = b;
@@ -740,23 +740,46 @@ where F: FnMut(&MatchPair) -> Result<()>
     let mut written = 0usize; let mut processed = 0usize;
     let mut last_chunk_start = Instant::now();
 
+    let mut next_rows_task: Option<tokio::task::JoinHandle<anyhow::Result<Vec<Person>>>> = None;
+
     while offset < total {
         if let Some(c) = &ctrl { if c.cancel.load(std::sync::atomic::Ordering::Relaxed) { break; } while c.pause.load(std::sync::atomic::Ordering::Relaxed) { tokio::time::sleep(std::time::Duration::from_millis(100)).await; } }
         // adaptive batch: memory based decrease, throughput-based increase
         let mem = memory_stats_mb();
         if mem.avail_mb < cfg.memory_soft_min_mb && batch > 10_000 { batch = (batch / 2).max(10_000); }
 
-        // fetch with retry
-        let mut tries = 0u32;
-        let rows: Vec<Person> = loop {
-            match fetch_person_rows_chunk(pool, outer_table, offset, batch).await {
-                Ok(v) => break v,
-                Err(e) => {
-                    tries += 1;
-                    if tries > cfg.retry_max { return Err(e); }
-                    let backoff = cfg.retry_backoff_ms * (1u64 << (tries.min(5)-1));
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
-                    continue;
+        // obtain rows: use prefetched task if available, else fetch with retry
+        let rows: Vec<Person> = if let Some(handle) = next_rows_task.take() {
+            // await the prefetched result
+            match handle.await {
+                Ok(res) => res?,
+                Err(_join_err) => {
+                    // fall back to direct fetch with retry if join failed
+                    let mut tries = 0u32;
+                    loop {
+                        match fetch_person_rows_chunk(pool, outer_table, offset, batch).await {
+                            Ok(v) => break v,
+                            Err(e) => {
+                                tries += 1;
+                                if tries > cfg.retry_max { return Err(e); }
+                                let backoff = cfg.retry_backoff_ms * (1u64 << (tries.min(5)-1));
+                                tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            let mut tries = 0u32;
+            loop {
+                match fetch_person_rows_chunk(pool, outer_table, offset, batch).await {
+                    Ok(v) => break v,
+                    Err(e) => {
+                        tries += 1;
+                        if tries > cfg.retry_max { return Err(e); }
+                        let backoff = cfg.retry_backoff_ms * (1u64 << (tries.min(5)-1));
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                    }
                 }
             }
         };
@@ -799,6 +822,31 @@ where F: FnMut(&MatchPair) -> Result<()>
         on_progress(ProgressUpdate { processed, total: total as usize, percent: frac * 100.0, eta_secs: eta, mem_used_mb: memx.used_mb, mem_avail_mb: memx.avail_mb, stage: "streaming", batch_size_current: Some(batch), gpu_total_mb: 0, gpu_free_mb: 0, gpu_active: false });
 
         // adaptive increase if fast
+
+        // prefetch next chunk while we process current one
+        if offset < total {
+            let pool_cloned = pool.clone();
+            let table = outer_table.to_string();
+            let next_off = offset;
+            let next_batch = batch;
+            let retry_max = cfg.retry_max;
+            let backoff_ms = cfg.retry_backoff_ms;
+            next_rows_task = Some(tokio::spawn(async move {
+                let mut tries = 0u32;
+                loop {
+                    match fetch_person_rows_chunk(&pool_cloned, &table, next_off, next_batch).await {
+                        Ok(v) => break Ok(v),
+                        Err(e) => {
+                            tries += 1;
+                            if tries > retry_max { break Err(e); }
+                            let backoff = backoff_ms * (1u64 << (tries.min(5)-1));
+                            tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                        }
+                    }
+                }
+            }));
+        }
+
         let dur = last_chunk_start.elapsed();
         if dur.as_millis() > 0 { // if chunk was quick and memory is plentiful, increase
             if memx.avail_mb > cfg.memory_soft_min_mb * 2 && dur < std::time::Duration::from_secs(1) {
@@ -866,23 +914,46 @@ where F: FnMut(&MatchPair) -> Result<()>
     let mut written = 0usize; let mut processed = 0usize;
     let mut last_chunk_start = Instant::now();
 
+    let mut next_rows_task_dual: Option<tokio::task::JoinHandle<anyhow::Result<Vec<Person>>>> = None;
+
     while offset < total {
         if let Some(c) = &ctrl { if c.cancel.load(std::sync::atomic::Ordering::Relaxed) { break; } while c.pause.load(std::sync::atomic::Ordering::Relaxed) { tokio::time::sleep(std::time::Duration::from_millis(100)).await; } }
         // adaptive batch: memory based decrease, throughput-based increase
         let mem = memory_stats_mb();
         if mem.avail_mb < cfg.memory_soft_min_mb && batch > 10_000 { batch = (batch / 2).max(10_000); }
 
-        // fetch with retry from the OUTER pool
-        let mut tries = 0u32;
-        let rows: Vec<Person> = loop {
-            match fetch_person_rows_chunk(outer_pool, outer_table, offset, batch).await {
-                Ok(v) => break v,
-                Err(e) => {
-                    tries += 1;
-                    if tries > cfg.retry_max { return Err(e); }
-                    let backoff = cfg.retry_backoff_ms * (1u64 << (tries.min(5)-1));
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
-                    continue;
+        // obtain rows: use prefetched task if available, else fetch with retry from OUTER pool
+        let rows: Vec<Person> = if let Some(handle) = next_rows_task_dual.take() {
+            match handle.await {
+                Ok(res) => res?,
+                Err(_join_err) => {
+                    let mut tries = 0u32;
+                    loop {
+                        match fetch_person_rows_chunk(outer_pool, outer_table, offset, batch).await {
+                            Ok(v) => break v,
+                            Err(e) => {
+                                tries += 1;
+                                if tries > cfg.retry_max { return Err(e); }
+                                let backoff = cfg.retry_backoff_ms * (1u64 << (tries.min(5)-1));
+                                tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            let mut tries = 0u32;
+            loop {
+                match fetch_person_rows_chunk(outer_pool, outer_table, offset, batch).await {
+                    Ok(v) => break v,
+                    Err(e) => {
+                        tries += 1;
+                        if tries > cfg.retry_max { return Err(e); }
+                        let backoff = cfg.retry_backoff_ms * (1u64 << (tries.min(5)-1));
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                    }
+
+
                 }
             }
         };
@@ -926,6 +997,31 @@ where F: FnMut(&MatchPair) -> Result<()>
         let eta = if frac > 0.0 { (start.elapsed().as_secs_f32() * (1.0 - frac) / frac) as u64 } else { 0 };
         let memx = memory_stats_mb();
         on_progress(ProgressUpdate { processed, total: total as usize, percent: frac * 100.0, eta_secs: eta, mem_used_mb: memx.used_mb, mem_avail_mb: memx.avail_mb, stage: "streaming", batch_size_current: Some(batch), gpu_total_mb: 0, gpu_free_mb: 0, gpu_active: false });
+
+
+        // prefetch next chunk (dual) while processing current one
+        if offset < total {
+            let pool_cloned = outer_pool.clone();
+            let table = outer_table.to_string();
+            let next_off = offset;
+            let next_batch = batch;
+            let retry_max = cfg.retry_max;
+            let backoff_ms = cfg.retry_backoff_ms;
+            next_rows_task_dual = Some(tokio::spawn(async move {
+                let mut tries = 0u32;
+                loop {
+                    match fetch_person_rows_chunk(&pool_cloned, &table, next_off, next_batch).await {
+                        Ok(v) => break Ok(v),
+                        Err(e) => {
+                            tries += 1;
+                            if tries > retry_max { break Err(e); }
+                            let backoff = backoff_ms * (1u64 << (tries.min(5)-1));
+                            tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                        }
+                    }
+                }
+            }));
+        }
 
         // adaptive increase if fast
         let dur = last_chunk_start.elapsed();
