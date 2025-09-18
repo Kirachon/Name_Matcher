@@ -154,21 +154,7 @@ impl GuiApp {
             ui.add(TextEdit::singleline(&mut self.pass).hint_text("password").password(true));
             ui.add(TextEdit::singleline(&mut self.db).hint_text("database"));
         });
-        ui.horizontal(|ui| {
-            if ui.button("Load Tables").on_hover_text("Query INFORMATION_SCHEMA to list tables").clicked() { self.load_tables(); }
-                if ui.button("Test Connection").on_hover_text("Checks DB connectivity using a lightweight query").clicked() { self.test_connection(); }
-                if ui.button("Estimate").on_hover_text("Estimate memory usage and choose a good mode").clicked() { self.estimate(); }
-            if self.enable_dual {
-                // Dual DB: pick table1 from DB1 list, table2 from DB2 list
-                if self.tables.is_empty() { ui.label("(Load DB1 tables)"); }
-                if self.tables2.is_empty() { ui.label("(Load DB2 tables)"); }
-                if !self.tables.is_empty() {
-                    ComboBox::from_label("Table 1 (DB1)")
-                        .selected_text(self.tables.get(self.table1_idx).cloned().unwrap_or_default())
-                        .show_ui(ui, |ui| {
-                            for (i, t) in self.tables.iter().enumerate() { ui.selectable_value(&mut self.table1_idx, i, t); }
-                        });
-                }
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.enable_dual, "Enable Cross-Database Matching")
                 .on_hover_text("Match Table 1 from Database 1 with Table 2 from Database 2");
@@ -184,6 +170,21 @@ impl GuiApp {
             });
         }
 
+        ui.horizontal(|ui| {
+            if ui.button("Load Tables").on_hover_text("Query INFORMATION_SCHEMA to list tables").clicked() { self.load_tables(); }
+                if ui.button("Test Connection").on_hover_text("Checks DB connectivity using a lightweight query").clicked() { self.test_connection(); }
+                if ui.button("Estimate").on_hover_text("Estimate memory usage and choose a good mode").clicked() { self.estimate(); }
+            if self.enable_dual {
+                // Dual DB: pick table1 from DB1 list, table2 from DB2 list
+                if self.tables.is_empty() { ui.label("(Load DB1 tables)"); }
+                if self.tables2.is_empty() { ui.label("(Load DB2 tables)"); }
+                if !self.tables.is_empty() {
+                    ComboBox::from_label("Table 1 (DB1)")
+                        .selected_text(self.tables.get(self.table1_idx).cloned().unwrap_or_default())
+                        .show_ui(ui, |ui| {
+                            for (i, t) in self.tables.iter().enumerate() { ui.selectable_value(&mut self.table1_idx, i, t); }
+                        });
+                }
                 if !self.tables2.is_empty() {
                     ComboBox::from_label("Table 2 (DB2)")
                         .selected_text(self.tables2.get(self.table2_idx).cloned().unwrap_or_default())
@@ -687,7 +688,14 @@ impl GuiApp {
 }
 
 impl App for GuiApp {
-    fn update(&mut self, ctx: &Context, _frame: &mut Frame) { self.poll_messages(); egui::CentralPanel::default().show(ctx, |ui| { self.ui_top(ui); }); }
+    fn update(&mut self, ctx: &Context, _frame: &mut Frame) {
+        self.poll_messages();
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                self.ui_top(ui);
+            });
+        });
+    }
 }
 
 fn main() -> eframe::Result<()> {
