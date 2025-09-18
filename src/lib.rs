@@ -5,4 +5,5 @@ pub mod matching;
 pub mod models;
 pub mod normalize;
 pub mod metrics;
+pub mod util;
 

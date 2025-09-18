@@ -41,3 +41,25 @@ impl TableColumns {
     }
 }
 
+// Column mapping for flexible schemas; map source column names to expected aliases.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnMapping {
+    pub id: String,
+    pub uuid: String,
+    pub first_name: String,
+    pub middle_name: Option<String>,
+    pub last_name: String,
+    pub birthdate: String,
+}
+
+impl Default for ColumnMapping {
+    fn default() -> Self {
+        Self { id: "id".into(), uuid: "uuid".into(), first_name: "first_name".into(), middle_name: Some("middle_name".into()), last_name: "last_name".into(), birthdate: "birthdate".into() }
+    }
+}
+
+impl ColumnMapping {
+    pub fn required_ok(&self) -> bool {
+        !self.id.is_empty() && !self.uuid.is_empty() && !self.first_name.is_empty() && !self.last_name.is_empty() && !self.birthdate.is_empty()
+    }
+}
