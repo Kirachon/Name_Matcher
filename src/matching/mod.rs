@@ -50,6 +50,40 @@ pub struct ProgressUpdate {
     pub batch_size_current: Option<i64>,
 }
 
+
+// --- Optional GPU backend abstraction ---
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputeBackend { Cpu, Gpu }
+
+#[derive(Debug, Clone, Copy)]
+pub struct GpuConfig { pub device_id: Option<usize>, pub mem_budget_mb: u64 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct MatchOptions { pub backend: ComputeBackend, pub gpu: Option<GpuConfig>, pub progress: ProgressConfig }
+
+impl Default for MatchOptions {
+    fn default() -> Self {
+        Self { backend: ComputeBackend::Cpu, gpu: None, progress: ProgressConfig::default() }
+    }
+}
+
+pub fn match_all_with_opts<F>(table1: &[Person], table2: &[Person], algo: MatchingAlgorithm, opts: MatchOptions, progress: F) -> Vec<MatchPair>
+where F: Fn(ProgressUpdate) + Sync,
+{
+    if matches!(algo, MatchingAlgorithm::Fuzzy) && matches!(opts.backend, ComputeBackend::Gpu) {
+        #[cfg(feature = "gpu")]
+        {
+            match gpu::match_fuzzy_gpu(table1, table2, opts, &progress) {
+                Ok(v) => return v,
+                Err(e) => { log::warn!("GPU fuzzy failed, falling back to CPU: {}", e); }
+            }
+        }
+        // If feature disabled or GPU path failed, fall through to CPU
+    }
+    match_all_progress(table1, table2, algo, opts.progress, progress)
+}
+
+
 fn matches_algo1(p1: &NormalizedPerson, p2: &NormalizedPerson) -> bool { p1.last_name == p2.last_name && p1.first_name == p2.first_name && p1.birthdate == p2.birthdate }
 fn matches_algo2(p1: &NormalizedPerson, p2: &NormalizedPerson) -> bool {
     let middle_match = match (&p1.middle_name, &p2.middle_name) { (Some(a), Some(b)) => a == b, (None, None) => true, _ => false };
@@ -134,7 +168,164 @@ where F: Fn(ProgressUpdate) + Sync,
         }
         if chunk_start.elapsed() > cfg.long_op_threshold { let _m = memory_stats_mb(); }
     }
+
     results
+}
+
+// --- GPU module (feature-gated) ---
+#[cfg(feature = "gpu")]
+mod gpu {
+    use super::*;
+    use anyhow::{anyhow, Result};
+    use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
+    use cudarc::nvrtc::compile_ptx;
+
+    const MAX_STR: usize = 64; // truncate names for GPU DP to keep registers/local mem bounded
+
+    // CUDA kernel source for per-pair Levenshtein (two-row DP; lengths capped to MAX_STR)
+    const LEV_KERNEL_SRC: &str = r#"
+    extern "C" __global__ void lev_kernel(
+        const char* a_buf, const int* a_off, const int* a_len,
+        const char* b_buf, const int* b_off, const int* b_len,
+        float* out, int n)
+    {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= n) return;
+        const int off_a = a_off[i]; int la = a_len[i]; if (la > (int)64) la = 64;
+        const int off_b = b_off[i]; int lb = b_len[i]; if (lb > (int)64) lb = 64;
+        const char* A = a_buf + off_a;
+        const char* B = b_buf + off_b;
+        int prev[65]; int curr[65];
+        for (int j=0;j<=lb;++j) prev[j] = j;
+        for (int ia=1; ia<=la; ++ia) {
+            curr[0] = ia;
+            char ca = A[ia-1];
+            for (int jb=1; jb<=lb; ++jb) {
+                int cost = (ca == B[jb-1]) ? 0 : 1;
+                int del = prev[jb] + 1;
+                int ins = curr[jb-1] + 1;
+                int sub = prev[jb-1] + cost;
+                int v = del < ins ? del : ins;
+                curr[jb] = v < sub ? v : sub;
+            }
+            for (int jb=0; jb<=lb; ++jb) prev[jb] = curr[jb];
+        }
+        int dist = prev[lb];
+        int ml = la > lb ? la : lb;
+        float score = ml > 0 ? (1.0f - ((float)dist / (float)ml)) * 100.0f : 100.0f;
+        out[i] = score;
+    }
+    "#;
+
+    pub fn match_fuzzy_gpu<F>(t1: &[Person], t2: &[Person], opts: MatchOptions, on_progress: &F) -> Result<Vec<MatchPair>>
+    where F: Fn(ProgressUpdate) + Sync
+    {
+        // 1) Normalize on CPU (reuse existing)
+        let n1: Vec<NormalizedPerson> = t1.par_iter().map(normalize_person).collect();
+        let n2: Vec<NormalizedPerson> = t2.par_iter().map(normalize_person).collect();
+        if n1.is_empty() || n2.is_empty() { return Ok(vec![]); }
+
+        // 2) Simple blocking by birthdate to reduce candidate pairs
+        use std::collections::HashMap;
+        let mut by_bd: HashMap<chrono::NaiveDate, Vec<usize>> = HashMap::new();
+        for (j, p) in n2.iter().enumerate() { by_bd.entry(p.birthdate).or_default().push(j); }
+
+        // 3) Prepare CUDA device
+        let dev_id = opts.gpu.and_then(|g| g.device_id).unwrap_or(0);
+        let dev = CudaDevice::new(dev_id).map_err(|e| anyhow!("CUDA init failed: {e}"))?;
+        let ptx = compile_ptx(LEV_KERNEL_SRC).map_err(|e| anyhow!("NVRTC compile failed: {e}"))?;
+        dev.load_ptx(ptx, "lev_mod", &[]).map_err(|e| anyhow!("Load PTX failed: {e}"))?;
+        let func = dev.get_func("lev_mod", "lev_kernel").map_err(|e| anyhow!("Get func failed: {e}"))?;
+
+        // 4) Tile candidates to respect memory budget
+        let mem_budget_mb = opts.gpu.map(|g| g.mem_budget_mb).unwrap_or(512);
+        // Rough bytes per pair: two strings up to 64 bytes + offsets/len + output ~ 256 bytes
+        let approx_bpp: usize = 256;
+        let mut tile_max = ((mem_budget_mb as usize * 1024 * 1024) / approx_bpp).max(1024);
+        tile_max = tile_max.min(200_000); // upper bound to keep launch sizes sane
+
+        let mut results: Vec<MatchPair> = Vec::new();
+        let total: usize = n1.len();
+        let mut processed: usize = 0;
+
+        for (i, p1) in n1.iter().enumerate() {
+            let Some(cands) = by_bd.get(&p1.birthdate) else { continue };
+            // Build candidate pairs for this outer p1 in tiles of tile_max
+            let mut start = 0;
+            while start < cands.len() {
+                let end = (start + tile_max).min(cands.len());
+                let cur = &cands[start..end];
+                // Build flat buffers for names
+                let mut a_offsets = Vec::<i32>::with_capacity(cur.len());
+                let mut a_lengths = Vec::<i32>::with_capacity(cur.len());
+                let mut b_offsets = Vec::<i32>::with_capacity(cur.len());
+                let mut b_lengths = Vec::<i32>::with_capacity(cur.len());
+                let mut a_bytes = Vec::<u8>::with_capacity(cur.len() * 32);
+                let mut b_bytes = Vec::<u8>::with_capacity(cur.len() * 32);
+                let mut names_a = Vec::<String>::with_capacity(cur.len()); // for CPU jaro/jw
+                let mut names_b = Vec::<String>::with_capacity(cur.len());
+                for &j_idx in cur {
+                    let p2 = &n2[j_idx];
+                    let s1 = normalize_simple(&format!("{} {} {}", p1.first_name, p1.middle_name.as_deref().unwrap_or(""), p1.last_name));
+                    let s2 = normalize_simple(&format!("{} {} {}", p2.first_name, p2.middle_name.as_deref().unwrap_or(""), p2.last_name));
+                    names_a.push(s1.clone()); names_b.push(s2.clone());
+                    let s1b = s1.as_bytes(); let s2b = s2.as_bytes();
+                    let a_off = a_bytes.len() as i32; a_offsets.push(a_off);
+                    let la = s1b.len().min(MAX_STR); a_lengths.push(la as i32);
+                    a_bytes.extend_from_slice(&s1b[..la]);
+                    let b_off = b_bytes.len() as i32; b_offsets.push(b_off);
+                    let lb = s2b.len().min(MAX_STR); b_lengths.push(lb as i32);
+                    b_bytes.extend_from_slice(&s2b[..lb]);
+                }
+                let n_pairs = cur.len();
+                if n_pairs == 0 { start = end; continue; }
+                // Device buffers
+                let d_a = dev.htod_copy(a_bytes.as_slice()).map_err(|e| anyhow!("htod a failed: {e}"))?;
+                let d_a_off = dev.htod_copy(a_offsets.as_slice()).map_err(|e| anyhow!("htod a_off failed: {e}"))?;
+                let d_a_len = dev.htod_copy(a_lengths.as_slice()).map_err(|e| anyhow!("htod a_len failed: {e}"))?;
+                let d_b = dev.htod_copy(b_bytes.as_slice()).map_err(|e| anyhow!("htod b failed: {e}"))?;
+                let d_b_off = dev.htod_copy(b_offsets.as_slice()).map_err(|e| anyhow!("htod b_off failed: {e}"))?;
+                let d_b_len = dev.htod_copy(b_lengths.as_slice()).map_err(|e| anyhow!("htod b_len failed: {e}"))?;
+                let mut d_out = dev.alloc_zeros::<f32>(n_pairs).map_err(|e| anyhow!("alloc out failed: {e}"))?;
+
+                // Launch kernel
+                let cfg = LaunchConfig::for_num_elems(n_pairs as u32);
+                unsafe { func.launch(cfg, (&d_a, &d_a_off, &d_a_len, &d_b, &d_b_off, &d_b_len, &mut d_out, n_pairs as i32)) }
+                    .map_err(|e| anyhow!("kernel launch failed: {e}"))?;
+
+                // Read back
+                let lev_scores: Vec<f32> = dev.dtoh_sync_copy(&d_out).map_err(|e| anyhow!("dtoh out failed: {e}"))?;
+
+                // Compose results with CPU JR/JW
+                for (k, &j_idx) in cur.iter().enumerate() {
+                    let p2 = &n2[j_idx];
+                    let lev = lev_scores[k] as f64;
+                    let jr = jaro(&names_a[k], &names_b[k]) * 100.0;
+                    let jw = jaro_winkler(&names_a[k], &names_b[k]) * 100.0;
+                    let score = lev.max(jr).max(jw);
+                    if score >= 85.0 {
+                        let mut fields = vec!["id","uuid","first_name","last_name","birthdate"]; // middle may be empty
+                        if n1[i].middle_name.is_some() || p2.middle_name.is_some() { fields.insert(3, "middle_name"); }
+                        results.push(MatchPair {
+                            person1: t1[i].clone(), person2: t2[j_idx].clone(),
+                            confidence: score as f32,
+                            matched_fields: fields.into_iter().map(String::from).collect(),
+                            is_matched_infnbd: false, is_matched_infnmnbd: false,
+                        });
+                    }
+                }
+
+                processed += cur.len();
+                let total_pairs_est = total.max(1) * 1; // rough; we still show percent over outer loop
+                let frac = (i as f32 / total as f32).clamp(0.0, 1.0);
+                let mem = memory_stats_mb();
+                on_progress(ProgressUpdate { processed: i+1, total, percent: frac*100.0, eta_secs: 0, mem_used_mb: mem.used_mb, mem_avail_mb: mem.avail_mb, stage: "gpu_fuzzy", batch_size_current: Some(cur.len() as i64) });
+
+                start = end;
+            }
+        }
+        Ok(results)
+    }
 }
 
 fn to_original<'a>(np: &NormalizedPerson, originals: &'a [Person]) -> Person {
@@ -168,7 +359,6 @@ mod tests {
     }
 
 }
-
 
 
 // --- Streaming matching and export for large datasets ---
