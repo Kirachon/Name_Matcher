@@ -1,4 +1,4 @@
-## What’s improved in Name Matcher
+## What’s improved in SRS-II Name Matching Application
 
 We’ve made name matching more reliable, especially for names with accents and characters from different languages.
 
