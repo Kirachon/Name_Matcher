@@ -48,6 +48,10 @@ pub struct ProgressUpdate {
     pub mem_avail_mb: u64,
     pub stage: &'static str,
     pub batch_size_current: Option<i64>,
+    // GPU-related (0/false when CPU-only)
+    pub gpu_total_mb: u64,
+    pub gpu_free_mb: u64,
+    pub gpu_active: bool,
 }
 
 
@@ -163,7 +167,7 @@ where F: Fn(ProgressUpdate) + Sync,
             let frac = (processed_outer as f32 / total as f32).clamp(0.0, 1.0);
             let eta_secs = if frac > 0.0 { (elapsed.as_secs_f32() * (1.0 - frac) / frac) as u64 } else { 0 };
             let mem = memory_stats_mb();
-            progress(ProgressUpdate { processed: processed_outer, total, percent: frac * 100.0, eta_secs, mem_used_mb: mem.used_mb, mem_avail_mb: mem.avail_mb, stage: "matching", batch_size_current: None });
+            progress(ProgressUpdate { processed: processed_outer, total, percent: frac * 100.0, eta_secs, mem_used_mb: mem.used_mb, mem_avail_mb: mem.avail_mb, stage: "matching", batch_size_current: None, gpu_total_mb: 0, gpu_free_mb: 0, gpu_active: false });
             last_update = processed_outer;
         }
         if chunk_start.elapsed() > cfg.long_op_threshold { let _m = memory_stats_mb(); }
@@ -173,6 +177,32 @@ where F: Fn(ProgressUpdate) + Sync,
 }
 
 // --- GPU module (feature-gated) ---
+#[cfg(feature = "gpu")]
+    // Helpers: memory info (best-effort) and simple Soundex for blocking
+    #[inline]
+    fn soundex4_ascii(s: &str) -> [u8;4] {
+        let mut out = [b'0';4]; if s.is_empty() { return out; }
+        let mut bytes = s.as_bytes().iter().copied().filter(|c| c.is_ascii_alphabetic());
+        if let Some(f) = bytes.next() { out[0] = f.to_ascii_uppercase(); }
+        let mut last = 0u8; let mut idx = 1usize;
+        for c in bytes { if idx>=4 { break; }
+            let d = match c.to_ascii_lowercase() { b'b'|b'f'|b'p'|b'v'=>1, b'c'|b'g'|b'j'|b'k'|b'q'|b's'|b'x'|b'z'=>2, b'd'|b't'=>3, b'l'=>4, b'm'|b'n'=>5, b'r'=>6, _=>0 };
+            if d!=0 && d!=last { out[idx]=(b'0'+d); idx+=1; }
+            last=d;
+        }
+        out
+    }
+
+    #[cfg(feature = "gpu")]
+    fn cuda_mem_info_mb(dev: &cudarc::driver::CudaDevice) -> (u64,u64) {
+        // Try cuMemGetInfo_v2; if unavailable, return zeros and rely on backoff.
+        #[allow(unused_unsafe)] unsafe {
+            let mut free: usize = 0; let mut total: usize = 0;
+            let res = cudarc::driver::sys::cuMemGetInfo_v2(&mut free as *mut _ as *mut _, &mut total as *mut _ as *mut _);
+            if res == 0 { ((total as u64)/1024/1024, (free as u64)/1024/1024) } else { (0,0) }
+        }
+    }
+
 #[cfg(feature = "gpu")]
 mod gpu {
     use super::*;
@@ -184,6 +214,9 @@ mod gpu {
 
     // CUDA kernel source for per-pair Levenshtein (two-row DP; lengths capped to MAX_STR)
     const LEV_KERNEL_SRC: &str = r#"
+    __device__ __forceinline__ int max_i(int a, int b) { return a > b ? a : b; }
+    __device__ __forceinline__ int min_i(int a, int b) { return a < b ? a : b; }
+
     extern "C" __global__ void lev_kernel(
         const char* a_buf, const int* a_off, const int* a_len,
         const char* b_buf, const int* b_off, const int* b_len,
@@ -215,6 +248,73 @@ mod gpu {
         float score = ml > 0 ? (1.0f - ((float)dist / (float)ml)) * 100.0f : 100.0f;
         out[i] = score;
     }
+
+    __device__ float jaro_core(const char* A, int la, const char* B, int lb) {
+        if (la == 0 && lb == 0) return 1.0f;
+        int match_dist = max_i(0, max_i(la, lb) / 2 - 1);
+        bool a_match[64]; bool b_match[64];
+        for (int i=0;i<64;++i) { a_match[i]=false; b_match[i]=false; }
+        int matches = 0;
+        for (int i=0;i<la; ++i) {
+            int start = max_i(0, i - match_dist);
+            int end = min_i(i + match_dist + 1, lb);
+            for (int j=start; j<end; ++j) {
+                if (b_match[j]) continue;
+                if (A[i] != B[j]) continue;
+                a_match[i] = true; b_match[j] = true; ++matches; break;
+            }
+        }
+        if (matches == 0) return 0.0f;
+        int k = 0; int trans = 0;
+        let func_jaro = dev.get_func("lev_mod", "jaro_kernel").map_err(|e| anyhow!("Get jaro func failed: {e}"))?;
+        let func_jw = dev.get_func("lev_mod", "jw_kernel").map_err(|e| anyhow!("Get jw func failed: {e}"))?;
+
+        for (int i=0;i<la; ++i) {
+            if (!a_match[i]) continue;
+            while (k < lb && !b_match[k]) ++k;
+            if (k < lb && A[i] != B[k]) ++trans;
+            ++k;
+        }
+        float m = (float)matches;
+        float j1 = m / la;
+        float j2 = m / lb;
+        float j3 = (m - trans/2.0f) / m;
+        return (j1 + j2 + j3) / 3.0f;
+    }
+
+    extern "C" __global__ void jaro_kernel(
+        const char* a_buf, const int* a_off, const int* a_len,
+        const char* b_buf, const int* b_off, const int* b_len,
+        float* out, int n)
+    {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= n) return;
+        int la = a_len[i]; if (la > 64) la = 64;
+        int lb = b_len[i]; if (lb > 64) lb = 64;
+        const char* A = a_buf + a_off[i];
+        const char* B = b_buf + b_off[i];
+        float j = jaro_core(A, la, B, lb);
+        out[i] = j * 100.0f;
+    }
+
+    extern "C" __global__ void jw_kernel(
+        const char* a_buf, const int* a_off, const int* a_len,
+        const char* b_buf, const int* b_off, const int* b_len,
+        float* out, int n)
+    {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= n) return;
+        int la = a_len[i]; if (la > 64) la = 64;
+        int lb = b_len[i]; if (lb > 64) lb = 64;
+        const char* A = a_buf + a_off[i];
+        const char* B = b_buf + b_off[i];
+        float j = jaro_core(A, la, B, lb);
+        int l = 0; int maxp = 4;
+        for (int k=0; k<min_i(min_i(la, lb), maxp); ++k) { if (A[k] == B[k]) ++l; else break; }
+        float p = 0.1f;
+        float jw = j + l * p * (1.0f - j);
+        out[i] = jw * 100.0f;
+    }
     "#;
 
     pub fn match_fuzzy_gpu<F>(t1: &[Person], t2: &[Person], opts: MatchOptions, on_progress: &F) -> Result<Vec<MatchPair>>
@@ -225,10 +325,18 @@ mod gpu {
         let n2: Vec<NormalizedPerson> = t2.par_iter().map(normalize_person).collect();
         if n1.is_empty() || n2.is_empty() { return Ok(vec![]); }
 
-        // 2) Simple blocking by birthdate to reduce candidate pairs
-        use std::collections::HashMap;
-        let mut by_bd: HashMap<chrono::NaiveDate, Vec<usize>> = HashMap::new();
-        for (j, p) in n2.iter().enumerate() { by_bd.entry(p.birthdate).or_default().push(j); }
+        // 2) Sophisticated multi-field blocking to reduce candidate pairs
+        use std::collections::{HashMap, HashSet};
+        #[derive(Hash, Eq, PartialEq)]
+        struct BKey(u16, u8, u8, [u8;4]); // (birth year, first initial, last initial, last name soundex)
+        let mut block: HashMap<BKey, Vec<usize>> = HashMap::new();
+        for (j, p) in n2.iter().enumerate() {
+            let year = p.birthdate.year() as u16;
+            let fi = p.first_name.bytes().find(|c| c.is_ascii_alphabetic()).unwrap_or(b'?').to_ascii_uppercase();
+            let li = p.last_name.bytes().find(|c| c.is_ascii_alphabetic()).unwrap_or(b'?').to_ascii_uppercase();
+            let sx = super::soundex4_ascii(&p.last_name);
+            block.entry(BKey(year, fi, li, sx)).or_default().push(j);
+        }
 
         // 3) Prepare CUDA device
         let dev_id = opts.gpu.and_then(|g| g.device_id).unwrap_or(0);
@@ -236,6 +344,14 @@ mod gpu {
         let ptx = compile_ptx(LEV_KERNEL_SRC).map_err(|e| anyhow!("NVRTC compile failed: {e}"))?;
         dev.load_ptx(ptx, "lev_mod", &[]).map_err(|e| anyhow!("Load PTX failed: {e}"))?;
         let func = dev.get_func("lev_mod", "lev_kernel").map_err(|e| anyhow!("Get func failed: {e}"))?;
+        let func_jaro = dev.get_func("lev_mod", "jaro_kernel").map_err(|e| anyhow!("Get jaro func failed: {e}"))?;
+        let func_jw = dev.get_func("lev_mod", "jw_kernel").map_err(|e| anyhow!("Get jw func failed: {e}"))?;
+
+        // Report GPU init and memory info
+        let (gpu_total_mb, mut gpu_free_mb) = cuda_mem_info_mb(&dev);
+        let mem0 = memory_stats_mb();
+        on_progress(ProgressUpdate { processed: 0, total: n1.len(), percent: 0.0, eta_secs: 0, mem_used_mb: mem0.used_mb, mem_avail_mb: mem0.avail_mb, stage: "gpu_init", batch_size_current: None, gpu_total_mb, gpu_free_mb, gpu_active: true });
+
 
         // 4) Tile candidates to respect memory budget
         let mem_budget_mb = opts.gpu.map(|g| g.mem_budget_mb).unwrap_or(512);
@@ -249,12 +365,23 @@ mod gpu {
         let mut processed: usize = 0;
 
         for (i, p1) in n1.iter().enumerate() {
-            let Some(cands) = by_bd.get(&p1.birthdate) else { continue };
+            let year = p1.birthdate.year() as u16;
+            let fi = p1.first_name.bytes().find(|c| c.is_ascii_alphabetic()).unwrap_or(b'?').to_ascii_uppercase();
+            let li = p1.last_name.bytes().find(|c| c.is_ascii_alphabetic()).unwrap_or(b'?').to_ascii_uppercase();
+            let sx = super::soundex4_ascii(&p1.last_name);
+            let mut set: HashSet<usize> = HashSet::new();
+            if let Some(v) = block.get(&BKey(year, fi, li, sx)) { set.extend(v.iter().copied()); }
+            // fallback: drop first initial
+            if set.is_empty() { if let Some(v) = block.get(&BKey(year, b'?', li, sx)) { set.extend(v.iter().copied()); } }
+            // fallback: drop soundex precision (use only first 2 digits)
+            if set.is_empty() { let mut sx2 = sx; sx2[2]=b'0'; sx2[3]=b'0'; if let Some(v) = block.get(&BKey(year, fi, li, sx2)) { set.extend(v.iter().copied()); } }
+            if set.is_empty() { continue; }
+            let cands_vec: Vec<usize> = set.into_iter().collect();
             // Build candidate pairs for this outer p1 in tiles of tile_max
             let mut start = 0;
-            while start < cands.len() {
-                let end = (start + tile_max).min(cands.len());
-                let cur = &cands[start..end];
+            while start < cands_vec.len() {
+                let end = (start + tile_max).min(cands_vec.len());
+                let cur = &cands_vec[start..end];
                 // Build flat buffers for names
                 let mut a_offsets = Vec::<i32>::with_capacity(cur.len());
                 let mut a_lengths = Vec::<i32>::with_capacity(cur.len());
@@ -279,47 +406,87 @@ mod gpu {
                 }
                 let n_pairs = cur.len();
                 if n_pairs == 0 { start = end; continue; }
-                // Device buffers
-                let d_a = dev.htod_copy(a_bytes.as_slice()).map_err(|e| anyhow!("htod a failed: {e}"))?;
-                let d_a_off = dev.htod_copy(a_offsets.as_slice()).map_err(|e| anyhow!("htod a_off failed: {e}"))?;
-                let d_a_len = dev.htod_copy(a_lengths.as_slice()).map_err(|e| anyhow!("htod a_len failed: {e}"))?;
-                let d_b = dev.htod_copy(b_bytes.as_slice()).map_err(|e| anyhow!("htod b failed: {e}"))?;
-                let d_b_off = dev.htod_copy(b_offsets.as_slice()).map_err(|e| anyhow!("htod b_off failed: {e}"))?;
-                let d_b_len = dev.htod_copy(b_lengths.as_slice()).map_err(|e| anyhow!("htod b_len failed: {e}"))?;
-                let mut d_out = dev.alloc_zeros::<f32>(n_pairs).map_err(|e| anyhow!("alloc out failed: {e}"))?;
 
-                // Launch kernel
-                let cfg = LaunchConfig::for_num_elems(n_pairs as u32);
-                unsafe { func.launch(cfg, (&d_a, &d_a_off, &d_a_len, &d_b, &d_b_off, &d_b_len, &mut d_out, n_pairs as i32)) }
-                    .map_err(|e| anyhow!("kernel launch failed: {e}"))?;
+                // Adaptive attempt with backoff on OOM
+                let mut attempt_ok = false;
+                loop {
+                    // refresh GPU free mem for display
+                    let (_tot, free_now) = cuda_mem_info_mb(&dev); gpu_free_mb = free_now.max(gpu_free_mb);
+                    let try_run: anyhow::Result<Vec<f32>> = (|| {
+                        // Device buffers
+                        let d_a = dev.htod_copy(a_bytes.as_slice())?;
+                        let d_a_off = dev.htod_copy(a_offsets.as_slice())?;
+                        let d_a_len = dev.htod_copy(a_lengths.as_slice())?;
+                        let d_b = dev.htod_copy(b_bytes.as_slice())?;
+                        let d_b_off = dev.htod_copy(b_offsets.as_slice())?;
+                        let d_b_len = dev.htod_copy(b_lengths.as_slice())?;
+                        let mut d_out = dev.alloc_zeros::<f32>(n_pairs)?;
+                        let mut d_out_j = dev.alloc_zeros::<f32>(n_pairs)?;
+                        let mut d_out_w = dev.alloc_zeros::<f32>(n_pairs)?;
+                        // Launch kernels
+                        let cfg = LaunchConfig::for_num_elems(n_pairs as u32);
+                        unsafe { func.launch(cfg, (&d_a, &d_a_off, &d_a_len, &d_b, &d_b_off, &d_b_len, &mut d_out, n_pairs as i32)) }?;
+                        unsafe { func_jaro.launch(cfg, (&d_a, &d_a_off, &d_a_len, &d_b, &d_b_off, &d_b_len, &mut d_out_j, n_pairs as i32)) }?;
+                        unsafe { func_jw.launch(cfg, (&d_a, &d_a_off, &d_a_len, &d_b, &d_b_off, &d_b_len, &mut d_out_w, n_pairs as i32)) }?;
+                        // Read back and combine
+                        let lev_scores: Vec<f32> = dev.dtoh_sync_copy(&d_out)?;
+                        let jaro_scores: Vec<f32> = dev.dtoh_sync_copy(&d_out_j)?;
+                        let jw_scores: Vec<f32> = dev.dtoh_sync_copy(&d_out_w)?;
+                        let mut final_scores = lev_scores;
+                        for idx in 0..final_scores.len() {
+                            let mut s = final_scores[idx];
+                            if jaro_scores[idx] > s { s = jaro_scores[idx]; }
+                            if jw_scores[idx] > s { s = jw_scores[idx]; }
+                            final_scores[idx] = s;
+                        }
+                        Ok(final_scores)
+                    })();
 
-                // Read back
-                let lev_scores: Vec<f32> = dev.dtoh_sync_copy(&d_out).map_err(|e| anyhow!("dtoh out failed: {e}"))?;
-
-                // Compose results with CPU JR/JW
-                for (k, &j_idx) in cur.iter().enumerate() {
-                    let p2 = &n2[j_idx];
-                    let lev = lev_scores[k] as f64;
-                    let jr = jaro(&names_a[k], &names_b[k]) * 100.0;
-                    let jw = jaro_winkler(&names_a[k], &names_b[k]) * 100.0;
-                    let score = lev.max(jr).max(jw);
-                    if score >= 85.0 {
-                        let mut fields = vec!["id","uuid","first_name","last_name","birthdate"]; // middle may be empty
-                        if n1[i].middle_name.is_some() || p2.middle_name.is_some() { fields.insert(3, "middle_name"); }
-                        results.push(MatchPair {
-                            person1: t1[i].clone(), person2: t2[j_idx].clone(),
-                            confidence: score as f32,
-                            matched_fields: fields.into_iter().map(String::from).collect(),
-                            is_matched_infnbd: false, is_matched_infnmnbd: false,
-                        });
+                    match try_run {
+                        Ok(lev_scores) => {
+                            // Compose results with CPU JR/JW (will move to GPU later)
+                            for (k, &j_idx) in cur.iter().enumerate() {
+                                let p2 = &n2[j_idx];
+                                let score = lev_scores[k] as f64;
+                                if score >= 85.0 {
+                                    let mut fields = vec!["id","uuid","first_name","last_name","birthdate"]; // middle may be empty
+                                    if n1[i].middle_name.is_some() || p2.middle_name.is_some() { fields.insert(3, "middle_name"); }
+                                    results.push(MatchPair {
+                                        person1: t1[i].clone(), person2: t2[j_idx].clone(),
+                                        confidence: score as f32,
+                                        matched_fields: fields.into_iter().map(String::from).collect(),
+                                        is_matched_infnbd: false, is_matched_infnmnbd: false,
+                                    });
+                                }
+                            }
+                            attempt_ok = true;
+                            break;
+                        }
+                        Err(e) => {
+                            // back off tile size and retry
+                            log::warn!("GPU tile failed ({}); reducing tile_max from {}", e, tile_max);
+                            if tile_max <= 512 { return Err(anyhow!("GPU processing failed even at minimal tile size: {}", e)); }
+                            tile_max = (tile_max / 2).max(512);
+                            // rebuild slice bounds at new tile size
+                            let new_end = (start + tile_max).min(cands_vec.len());
+                            if new_end == end { // cannot shrink further without progress
+                                return Err(anyhow!("GPU processing failed and could not shrink tile further"));
+                            }
+                            // adjust cur to smaller slice
+                            // Note: restart outer while-loop iteration with smaller end
+                            // by resetting end and continue
+                            // We break out to while start<... with the smaller tile_max
+                            break;
+                        }
                     }
                 }
+                if !attempt_ok { continue; }
 
                 processed += cur.len();
                 let total_pairs_est = total.max(1) * 1; // rough; we still show percent over outer loop
                 let frac = (i as f32 / total as f32).clamp(0.0, 1.0);
                 let mem = memory_stats_mb();
-                on_progress(ProgressUpdate { processed: i+1, total, percent: frac*100.0, eta_secs: 0, mem_used_mb: mem.used_mb, mem_avail_mb: mem.avail_mb, stage: "gpu_fuzzy", batch_size_current: Some(cur.len() as i64) });
+                on_progress(ProgressUpdate { processed: i+1, total, percent: frac*100.0, eta_secs: 0, mem_used_mb: mem.used_mb, mem_avail_mb: mem.avail_mb, stage: "gpu_kernel", batch_size_current: Some(cur.len() as i64), gpu_total_mb: gpu_total_mb, gpu_free_mb: gpu_free_mb, gpu_active: true });
 
                 start = end;
             }
@@ -427,10 +594,10 @@ where F: FnMut(&MatchPair) -> Result<()>
     let start = Instant::now();
     // Progress: indexing start
     let mems = memory_stats_mb();
-    on_progress(ProgressUpdate { processed: 0, total: total as usize, percent: 0.0, eta_secs: 0, mem_used_mb: mems.used_mb, mem_avail_mb: mems.avail_mb, stage: "indexing", batch_size_current: Some(batch) });
+    on_progress(ProgressUpdate { processed: 0, total: total as usize, percent: 0.0, eta_secs: 0, mem_used_mb: mems.used_mb, mem_avail_mb: mems.avail_mb, stage: "indexing", batch_size_current: Some(batch), gpu_total_mb: 0, gpu_free_mb: 0, gpu_active: false });
     let index = build_index(pool, inner_table, algo, batch).await?;
     let mems2 = memory_stats_mb();
-    on_progress(ProgressUpdate { processed: 0, total: total as usize, percent: 0.0, eta_secs: 0, mem_used_mb: mems2.used_mb, mem_avail_mb: mems2.avail_mb, stage: "indexing_done", batch_size_current: Some(batch) });
+    on_progress(ProgressUpdate { processed: 0, total: total as usize, percent: 0.0, eta_secs: 0, mem_used_mb: mems2.used_mb, mem_avail_mb: mems2.avail_mb, stage: "indexing_done", batch_size_current: Some(batch), gpu_total_mb: 0, gpu_free_mb: 0, gpu_active: false });
 
     let mut offset: i64 = 0; let mut written = 0usize; let mut processed = 0usize;
     let mem0 = memory_stats_mb();
@@ -456,7 +623,7 @@ where F: FnMut(&MatchPair) -> Result<()>
         let frac = (processed as f32 / total as f32).clamp(0.0, 1.0);
         let eta = if frac > 0.0 { (start.elapsed().as_secs_f32() * (1.0 - frac) / frac) as u64 } else { 0 };
         let memx = memory_stats_mb();
-        on_progress(ProgressUpdate { processed, total: total as usize, percent: frac * 100.0, eta_secs: eta, mem_used_mb: memx.used_mb, mem_avail_mb: memx.avail_mb, stage: "streaming", batch_size_current: Some(batch) });
+        on_progress(ProgressUpdate { processed, total: total as usize, percent: frac * 100.0, eta_secs: eta, mem_used_mb: memx.used_mb, mem_avail_mb: memx.avail_mb, stage: "streaming", batch_size_current: Some(batch), gpu_total_mb: 0, gpu_free_mb: 0, gpu_active: false });
     }
     let _mem_end = memory_stats_mb(); let _ = mem0; // could log delta
     Ok(written)
