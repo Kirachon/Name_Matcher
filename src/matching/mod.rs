@@ -791,6 +791,132 @@ where F: FnMut(&MatchPair) -> Result<()>
     Ok(written)
 }
 
+// New: dual-pool variant to support cross-database streaming
+pub async fn stream_match_csv_dual<F>(
+    pool1: &MySqlPool,
+    pool2: &MySqlPool,
+    table1: &str,
+    table2: &str,
+    algo: MatchingAlgorithm,
+    mut on_match: F,
+    cfg: StreamingConfig,
+    on_progress: impl Fn(ProgressUpdate),
+    ctrl: Option<StreamControl>,
+) -> Result<usize>
+where F: FnMut(&MatchPair) -> Result<()>
+{
+    use crate::util::checkpoint::{load_checkpoint, save_checkpoint, remove_checkpoint, StreamCheckpoint};
+    if matches!(algo, MatchingAlgorithm::Fuzzy) { anyhow::bail!("Fuzzy algorithm is currently supported only in in-memory mode (CSV). Use algorithm=3 with CSV format."); }
+    let c1 = get_person_count(pool1, table1).await?;
+    let c2 = get_person_count(pool2, table2).await?;
+    // Decide inner/outer and corresponding pools
+    let inner_is_t2 = c2 <= c1;
+    let (inner_table, inner_pool, outer_table, outer_pool, total) = if inner_is_t2 {
+        (table2, pool2, table1, pool1, c1)
+    } else {
+        (table1, pool1, table2, pool2, c2)
+    };
+    let mut batch = cfg.batch_size.max(10_000);
+    let start = Instant::now();
+
+    // Progress: indexing start
+    let mems = memory_stats_mb();
+    on_progress(ProgressUpdate { processed: 0, total: total as usize, percent: 0.0, eta_secs: 0, mem_used_mb: mems.used_mb, mem_avail_mb: mems.avail_mb, stage: "indexing", batch_size_current: Some(batch), gpu_total_mb: 0, gpu_free_mb: 0, gpu_active: false });
+    let index = build_index(inner_pool, inner_table, algo, batch).await?;
+    let mems2 = memory_stats_mb();
+    on_progress(ProgressUpdate { processed: 0, total: total as usize, percent: 0.0, eta_secs: 0, mem_used_mb: mems2.used_mb, mem_avail_mb: mems2.avail_mb, stage: "indexing_done", batch_size_current: Some(batch), gpu_total_mb: 0, gpu_free_mb: 0, gpu_active: false });
+
+    // Resume support: detect checkpoint
+    let mut offset: i64 = 0;
+    if cfg.resume {
+        if let Some(p) = cfg.checkpoint_path.as_ref() {
+            if let Some(cp) = load_checkpoint(p) {
+                if cp.db == "" || (cp.table_inner == inner_table && cp.table_outer == outer_table && cp.algorithm == format!("{:?}", algo)) {
+                    offset = cp.next_offset.min(total);
+                    batch = cp.batch_size.max(10_000);
+                }
+            }
+        }
+    }
+
+    let mut written = 0usize; let mut processed = 0usize;
+    let mut last_chunk_start = Instant::now();
+
+    while offset < total {
+        if let Some(c) = &ctrl { if c.cancel.load(std::sync::atomic::Ordering::Relaxed) { break; } while c.pause.load(std::sync::atomic::Ordering::Relaxed) { tokio::time::sleep(std::time::Duration::from_millis(100)).await; } }
+        // adaptive batch: memory based decrease, throughput-based increase
+        let mem = memory_stats_mb();
+        if mem.avail_mb < cfg.memory_soft_min_mb && batch > 10_000 { batch = (batch / 2).max(10_000); }
+
+        // fetch with retry from the OUTER pool
+        let mut tries = 0u32;
+        let rows: Vec<Person> = loop {
+            match fetch_person_rows_chunk(outer_pool, outer_table, offset, batch).await {
+                Ok(v) => break v,
+                Err(e) => {
+                    tries += 1;
+                    if tries > cfg.retry_max { return Err(e); }
+                    let backoff = cfg.retry_backoff_ms * (1u64 << (tries.min(5)-1));
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                    continue;
+                }
+            }
+        };
+
+        for p in rows.iter() {
+            if let Some(c) = &ctrl { if c.cancel.load(std::sync::atomic::Ordering::Relaxed) { break; } while c.pause.load(std::sync::atomic::Ordering::Relaxed) { tokio::time::sleep(std::time::Duration::from_millis(50)).await; } }
+            let n = normalize_person(p);
+            let k = key_for(algo, &n);
+            if let Some(cands) = index.get(&k) {
+                for q in cands {
+                    let n2 = normalize_person(q);
+                    let ok = match algo { MatchingAlgorithm::IdUuidYasIsMatchedInfnbd => matches_algo1(&n, &n2), MatchingAlgorithm::IdUuidYasIsMatchedInfnmnbd => matches_algo2(&n, &n2), MatchingAlgorithm::Fuzzy => false };
+                    if ok {
+                        let pair = if inner_is_t2 { to_pair(p, q, algo, &n, &n2) } else { to_pair(q, p, algo, &n2, &n) };
+                        on_match(&pair)?; written += 1;
+                    }
+                }
+            }
+        }
+
+        offset += batch; processed = (processed + rows.len()).min(total as usize);
+
+        // save checkpoint
+        if let Some(p) = cfg.checkpoint_path.as_ref() {
+            let _ = save_checkpoint(p, &StreamCheckpoint {
+                db: String::new(),
+                table_inner: inner_table.to_string(),
+                table_outer: outer_table.to_string(),
+                algorithm: format!("{:?}", algo),
+                batch_size: batch,
+                next_offset: offset,
+                total_outer: total,
+                partition_idx: 0,
+                partition_name: "all".into(),
+                updated_utc: chrono::Utc::now().to_rfc3339(),
+            });
+        }
+
+        // progress update
+        let frac = (processed as f32 / total as f32).clamp(0.0, 1.0);
+        let eta = if frac > 0.0 { (start.elapsed().as_secs_f32() * (1.0 - frac) / frac) as u64 } else { 0 };
+        let memx = memory_stats_mb();
+        on_progress(ProgressUpdate { processed, total: total as usize, percent: frac * 100.0, eta_secs: eta, mem_used_mb: memx.used_mb, mem_avail_mb: memx.avail_mb, stage: "streaming", batch_size_current: Some(batch), gpu_total_mb: 0, gpu_free_mb: 0, gpu_active: false });
+
+        // adaptive increase if fast
+        let dur = last_chunk_start.elapsed();
+        if dur.as_millis() > 0 { if memx.avail_mb > cfg.memory_soft_min_mb * 2 && dur < std::time::Duration::from_secs(1) { let new_batch = (batch as f64 * 1.5) as i64; batch = new_batch.min(200_000).max(10_000); } }
+        last_chunk_start = Instant::now();
+        tokio::task::yield_now().await;
+    }
+
+    if let Some(p) = cfg.checkpoint_path.as_ref() { remove_checkpoint(p); }
+    Ok(written)
+}
+
+// Backward-compatible single-pool API can continue to be used alongside the dual-pool API
+
+
 
 // --- Partitioned streaming (multi-pass) ---
 use crate::util::partition::{PartitionStrategy, DefaultPartition};
@@ -854,6 +980,7 @@ where F: FnMut(&MatchPair) -> Result<()>
         let (inner_table, inner_where, inner_binds, inner_map) = if inner_is_t2 { (table2, &p2.where_sql, &p2.binds, mapping2) } else { (table1, &p1.where_sql, &p1.binds, mapping1) };
         let (outer_table, outer_where, outer_binds, outer_map) = if inner_is_t2 { (table1, &p1.where_sql, &p1.binds, mapping1) } else { (table2, &p2.where_sql, &p2.binds, mapping2) };
         let total_outer = if inner_is_t2 { c1 } else { c2 };
+
 
         let mems = memory_stats_mb();
         on_progress(ProgressUpdate { processed: 0, total: total_outer as usize, percent: 0.0, eta_secs: 0, mem_used_mb: mems.used_mb, mem_avail_mb: mems.avail_mb, stage: "indexing", batch_size_current: Some(batch), gpu_total_mb: 0, gpu_free_mb: 0, gpu_active: false });

@@ -10,12 +10,14 @@ mod matching;
 mod models;
 mod normalize;
 mod metrics;
+mod util;
+
 
 use crate::config::DatabaseConfig;
 use crate::db::{discover_table_columns, get_person_rows, get_person_count, make_pool};
 use crate::export::csv_export::{export_to_csv, CsvStreamWriter};
 use crate::export::xlsx_export::{export_to_xlsx, SummaryContext, XlsxStreamWriter};
-use crate::matching::{match_all_progress, MatchingAlgorithm, ProgressConfig, ProgressUpdate, stream_match_csv, StreamingConfig};
+use crate::matching::{match_all_progress, MatchingAlgorithm, ProgressConfig, ProgressUpdate, StreamingConfig, stream_match_csv_partitioned, PartitioningConfig, stream_match_csv_dual};
 
 #[tokio::main]
 async fn main() {
@@ -63,17 +65,36 @@ async fn run() -> Result<()> {
     };
 
     info!("Connecting to MySQL at {}:{} / db {}", cfg.host, cfg.port, cfg.database);
-    let pool = make_pool(&cfg).await?;
+    let cfg2_opt = {
+        let host2 = std::env::var("DB2_HOST").ok();
+        if let Some(h2) = host2 {
+            let port2 = std::env::var("DB2_PORT").ok().and_then(|s| s.parse::<u16>().ok()).unwrap_or(cfg.port);
+            let user2 = std::env::var("DB2_USER").ok().unwrap_or_else(|| cfg.username.clone());
+            let pass2 = std::env::var("DB2_PASS").ok().unwrap_or_else(|| cfg.password.clone());
+            let db2 = std::env::var("DB2_DATABASE").ok().unwrap_or_else(|| cfg.database.clone());
+            Some(DatabaseConfig { host: h2, port: port2, username: user2, password: pass2, database: db2 })
+        } else { None }
+    };
+    let pool1 = make_pool(&cfg).await?;
+    let (pool2_opt, db_label) = if let Some(cfg2) = &cfg2_opt {
+        info!("Connecting to second MySQL at {}:{} / db {}", cfg2.host, cfg2.port, cfg2.database);
+        let p2 = make_pool(cfg2).await?;
+        (Some(p2), format!("{} | {}", cfg.database, cfg2.database))
+    } else {
+        (None, cfg.database.clone())
+    };
 
 
     if matches!(algorithm, MatchingAlgorithm::Fuzzy) && format != "csv" {
         eprintln!("Fuzzy algorithm supports CSV format only. Use format=csv.");
         std::process::exit(2);
     }
+    let db2_name = cfg2_opt.as_ref().map(|c| c.database.clone()).unwrap_or_else(|| cfg.database.clone());
+
 
     // Validate schemas
-    let cols1 = discover_table_columns(&pool, &cfg.database, &table1).await?;
-    let cols2 = discover_table_columns(&pool, &cfg.database, &table2).await?;
+    let cols1 = discover_table_columns(&pool1, &cfg.database, &table1).await?;
+    let cols2 = discover_table_columns(pool2_opt.as_ref().unwrap_or(&pool1), &db2_name, &table2).await?;
     cols1.validate_basic()?;
     cols2.validate_basic()?;
     info!("{} columns: {:?}", table1, cols1);
@@ -84,28 +105,44 @@ async fn run() -> Result<()> {
     }
 
     // Decide execution mode (streaming vs in-memory)
-    let c1 = get_person_count(&pool, &table1).await?;
-    let c2 = get_person_count(&pool, &table2).await?;
+    let c1 = get_person_count(&pool1, &table1).await?;
+    let c2 = get_person_count(pool2_opt.as_ref().unwrap_or(&pool1), &table2).await?;
     let streaming_env = std::env::var("NAME_MATCHER_STREAMING").ok().map(|v| v == "1" || v.eq_ignore_ascii_case("true") ).unwrap_or(false);
     let big_data_heuristic = (c1 + c2) > 200_000; // heuristic threshold
-    let use_streaming = if matches!(algorithm, MatchingAlgorithm::Fuzzy) { false } else { streaming_env || big_data_heuristic };
+    let part_strategy = std::env::var("NAME_MATCHER_PARTITION").unwrap_or_else(|_| "last_initial".to_string());
+    let use_streaming = streaming_env || big_data_heuristic || matches!(algorithm, MatchingAlgorithm::Fuzzy);
 
     use crate::metrics::memory_stats_mb;
     let cfgp = ProgressConfig { update_every: 1000, ..Default::default() };
 
     if use_streaming {
         info!("Streaming mode enabled ({} + {} rows).", c1, c2);
-        let s_cfg = StreamingConfig::default();
+        let mut s_cfg = StreamingConfig::default();
+        s_cfg.checkpoint_path = Some(format!("{}.nmckpt", out_path));
         if format == "csv" || format == "both" {
             info!("Streaming CSV export to {} using {:?}", out_path, algorithm);
             let mut writer = CsvStreamWriter::create(&out_path, algorithm)?;
             let t_match = std::time::Instant::now();
-            let count = stream_match_csv(&pool, &table1, &table2, algorithm, |pair| { writer.write(pair) }, s_cfg, |u: ProgressUpdate| {
-                info!("Progress: {:.1}% | ETA: {}s | Mem used: {} MB | Avail: {} MB ({} / {})",
-                    u.percent, u.eta_secs, u.mem_used_mb, u.mem_avail_mb, u.processed, u.total);
-            }, None).await?;
-            writer.flush()?;
-            info!("Wrote {} matches (streaming) in {:?}", count, t_match.elapsed());
+            let flush_every = s_cfg.flush_every;
+            let mut n_flushed = 0usize;
+            if let Some(p2) = &pool2_opt {
+                let count = stream_match_csv_dual(&pool1, p2, &table1, &table2, algorithm, |pair| {
+                    writer.write(pair)?; n_flushed += 1; if n_flushed % flush_every == 0 { writer.flush_partial()?; } Ok(())
+                }, s_cfg.clone(), |u: ProgressUpdate| {
+                    info!("[dual] {:.1}% | ETA: {}s | Mem used: {} MB | Avail: {} MB ({} / {})",
+                        u.percent, u.eta_secs, u.mem_used_mb, u.mem_avail_mb, u.processed, u.total);
+                }, None).await?;
+                writer.flush()?;
+                info!("Wrote {} matches (streaming, dual-db) in {:?}", count, t_match.elapsed());
+            } else {
+                let pc = PartitioningConfig { enabled: true, strategy: part_strategy.clone() };
+                let count = stream_match_csv_partitioned(&pool1, &table1, &table2, algorithm, |pair| { writer.write(pair)?; n_flushed += 1; if n_flushed % flush_every == 0 { writer.flush_partial()?; } Ok(()) }, s_cfg.clone(), |u: ProgressUpdate| {
+                    info!("[part] {:.1}% | ETA: {}s | Mem used: {} MB | Avail: {} MB ({} / {})",
+                        u.percent, u.eta_secs, u.mem_used_mb, u.mem_avail_mb, u.processed, u.total);
+                }, None, None, None, pc).await?;
+                writer.flush()?;
+                info!("Wrote {} matches (streaming) in {:?}", count, t_match.elapsed());
+            }
         }
         if format == "xlsx" || format == "both" {
             // Streaming both algorithms into an XLSX workbook
@@ -114,15 +151,25 @@ async fn run() -> Result<()> {
             let mut xw = XlsxStreamWriter::create(&xlsx_path)?;
             let t1 = std::time::Instant::now();
             let mut algo1_count = 0usize;
-            stream_match_csv(&pool, &table1, &table2, MatchingAlgorithm::IdUuidYasIsMatchedInfnbd, |pair| { algo1_count += 1; xw.append_algo1(pair) }, s_cfg, |_u| {}, None).await?;
+            if let Some(p2) = &pool2_opt {
+                stream_match_csv_dual(&pool1, p2, &table1, &table2, MatchingAlgorithm::IdUuidYasIsMatchedInfnbd, |pair| { algo1_count += 1; xw.append_algo1(pair) }, s_cfg.clone(), |_u| {}, None).await?;
+            } else {
+                let pc = PartitioningConfig { enabled: true, strategy: part_strategy.clone() };
+                stream_match_csv_partitioned(&pool1, &table1, &table2, MatchingAlgorithm::IdUuidYasIsMatchedInfnbd, |pair| { algo1_count += 1; xw.append_algo1(pair) }, s_cfg.clone(), |_u| {}, None, None, None, pc.clone()).await?;
+            }
             let took_a1 = t1.elapsed();
             let t2 = std::time::Instant::now();
             let mut algo2_count = 0usize;
-            stream_match_csv(&pool, &table1, &table2, MatchingAlgorithm::IdUuidYasIsMatchedInfnmnbd, |pair| { algo2_count += 1; xw.append_algo2(pair) }, s_cfg, |_u| {}, None).await?;
+            if let Some(p2) = &pool2_opt {
+                stream_match_csv_dual(&pool1, p2, &table1, &table2, MatchingAlgorithm::IdUuidYasIsMatchedInfnmnbd, |pair| { algo2_count += 1; xw.append_algo2(pair) }, s_cfg.clone(), |_u| {}, None).await?;
+            } else {
+                let pc = PartitioningConfig { enabled: true, strategy: part_strategy.clone() };
+                stream_match_csv_partitioned(&pool1, &table1, &table2, MatchingAlgorithm::IdUuidYasIsMatchedInfnmnbd, |pair| { algo2_count += 1; xw.append_algo2(pair) }, s_cfg.clone(), |_u| {}, None, None, None, pc).await?;
+            }
             let took_a2 = t2.elapsed();
             let mem_end = memory_stats_mb().used_mb;
             let summary = SummaryContext {
-                db_name: cfg.database.clone(),
+                db_name: db_label.clone(),
                 table1: table1.clone(),
                 table2: table2.clone(),
                 total_table1: c1 as usize,
@@ -147,8 +194,8 @@ async fn run() -> Result<()> {
         // In-memory fallback (previous behavior)
         info!("Fetching rows from {} and {}", table1, table2);
         let t_fetch = std::time::Instant::now();
-        let people1 = get_person_rows(&pool, &table1).await?;
-        let people2 = get_person_rows(&pool, &table2).await?;
+        let people1 = get_person_rows(&pool1, &table1).await?;
+        let people2 = get_person_rows(pool2_opt.as_ref().unwrap_or(&pool1), &table2).await?;
         let took_fetch = t_fetch.elapsed();
         if took_fetch.as_secs() >= 30 { info!("Fetching took {:?}", took_fetch); }
 
@@ -197,7 +244,7 @@ async fn run() -> Result<()> {
             let t_export = std::time::Instant::now();
             let mem_end = memory_stats_mb().used_mb;
             let summary = SummaryContext {
-                db_name: cfg.database.clone(),
+                db_name: db_label.clone(),
                 table1: table1.clone(),
                 table2: table2.clone(),
                 total_table1: people1.len(),

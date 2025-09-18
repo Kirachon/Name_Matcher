@@ -71,6 +71,10 @@ fn write_pair(w: &mut Writer<std::fs::File>, pair: &MatchPair, algorithm: Matchi
             ])?;
         }
         MatchingAlgorithm::Fuzzy => {
+            if pair.confidence < 0.95 {
+                // Skip writing fuzzy matches below 95% per new requirement
+                return Ok(());
+            }
             w.write_record(&[
                 pair.person1.id.to_string(),
                 pair.person1.uuid.clone(),
@@ -105,5 +109,6 @@ impl CsvStreamWriter {
         Ok(Self { writer, algo: algorithm })
     }
     pub fn write(&mut self, pair: &MatchPair) -> Result<()> { write_pair(&mut self.writer, pair, self.algo) }
+    pub fn flush_partial(&mut self) -> Result<()> { self.writer.flush()?; Ok(()) }
     pub fn flush(mut self) -> Result<()> { self.writer.flush()?; Ok(()) }
 }
