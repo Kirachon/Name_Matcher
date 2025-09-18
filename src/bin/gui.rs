@@ -73,6 +73,8 @@ struct GuiApp {
     stage: String,
     batch_current: i64,
     rps: f32,
+    last_tick: Option<std::time::Instant>,
+    last_processed_prev: usize,
     // GPU status
     gpu_total_mb: u64,
     gpu_free_mb: u64,
@@ -129,6 +131,8 @@ impl Default for GuiApp {
             stage: String::from("idle"),
             batch_current: 0,
             rps: 0.0,
+            last_tick: None,
+            last_processed_prev: 0,
 
             gpu_total_mb: 0,
             gpu_free_mb: 0,
@@ -257,12 +261,18 @@ impl GuiApp {
                 ui.checkbox(&mut self.use_gpu, "Use GPU (CUDA)").on_hover_text("Enable CUDA acceleration for Fuzzy (Algorithm 3). Falls back to CPU if unavailable.");
                 ui.label("GPU Mem Budget (MB)"); ui.add(TextEdit::singleline(&mut self.gpu_mem_mb).desired_width(80.0));
                 if ui.button("Auto Optimize").clicked() {
-                    // simple heuristic: larger memory on desktop, smaller on laptop
-                    self.gpu_mem_mb = if self.mem_avail > 8192 { "1024".into() } else { "512".into() };
-            if self.gpu_total_mb > 0 {
-                ui.label(format!("GPU: {} MB free / {} MB total | {}", self.gpu_free_mb, self.gpu_total_mb, if self.gpu_active { "active" } else { "idle" }));
-            }
-
+                    let mem = name_matcher::metrics::memory_stats_mb();
+                    let scfg = name_matcher::matching::compute_stream_cfg(mem.avail_mb);
+                    self.batch_size = scfg.batch_size.to_string();
+                    self.mem_thresh = scfg.memory_soft_min_mb.to_string();
+                    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8) as u32;
+                    let pool_suggestion = std::cmp::min(32, cores.saturating_mul(2));
+                    self.pool_size = pool_suggestion.to_string();
+                    if matches!(self.algo, MatchingAlgorithm::Fuzzy) { self.mode = ModeSel::InMemory; } else { self.mode = ModeSel::Streaming; }
+                    self.gpu_mem_mb = if mem.avail_mb > 8192 { "1024".into() } else { "512".into() };
+                }
+                if self.gpu_total_mb > 0 {
+                    ui.label(format!("GPU: {} MB free / {} MB total | {}", self.gpu_free_mb, self.gpu_total_mb, if self.gpu_active { "active" } else { "idle" }));
                 }
             });
         });
@@ -671,14 +681,14 @@ impl GuiApp {
                     self.gpu_total_mb = u.gpu_total_mb; self.gpu_free_mb = u.gpu_free_mb; self.gpu_active = u.gpu_active;
                     self.processed = u.processed; self.total = u.total; self.batch_current = u.batch_size_current.unwrap_or(0); self.stage = u.stage.to_string();
                     let now = std::time::Instant::now();
-                    static mut LAST_T: Option<std::time::Instant> = None; static mut LAST_P: usize = 0;
-                    unsafe {
-                        match LAST_T {
-                            Some(t0) => { let dt = now.duration_since(t0).as_secs_f32().max(1e-3); self.rps = ((self.processed.saturating_sub(LAST_P)) as f32 / dt).max(0.0); },
-                            None => { self.rps = 0.0; }
-                        }
-                        LAST_T = Some(now); LAST_P = self.processed;
+                    if let Some(t0) = self.last_tick {
+                        let dt = now.duration_since(t0).as_secs_f32().max(1e-3);
+                        self.rps = ((self.processed.saturating_sub(self.last_processed_prev)) as f32 / dt).max(0.0);
+                    } else {
+                        self.rps = 0.0;
                     }
+                    self.last_tick = Some(now);
+                    self.last_processed_prev = self.processed;
                     self.status = format!("{} | {:.1}% | {} / {} recs | {:.0} rec/s", self.stage, u.percent, self.processed, self.total, self.rps);
                 }
                 Msg::Info(s) => { self.status = s; }

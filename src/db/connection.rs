@@ -10,9 +10,15 @@ pub async fn make_pool(cfg: &DatabaseConfig) -> Result<MySqlPool> {
 
 pub async fn make_pool_with_size(cfg: &DatabaseConfig, max: Option<u32>) -> Result<MySqlPool> {
     let url = cfg.to_url();
-    let max_conn = max
-        .or_else(|| std::env::var("NAME_MATCHER_POOL_SIZE").ok().and_then(|s| s.parse().ok()))
-        .unwrap_or(16);
+    let max_conn: u32 = if let Some(m) = max {
+        m
+    } else if let Ok(s) = std::env::var("NAME_MATCHER_POOL_SIZE") {
+        s.parse().unwrap_or(0)
+    } else {
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8) as u32;
+        std::cmp::min(32, cores.saturating_mul(2))
+    };
+    let max_conn = if max_conn == 0 { 16 } else { max_conn };
     let min_conn: u32 = std::env::var("NAME_MATCHER_POOL_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
     let acquire_ms: u64 = std::env::var("NAME_MATCHER_ACQUIRE_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(30_000);
     let idle_ms: u64 = std::env::var("NAME_MATCHER_IDLE_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(60_000);

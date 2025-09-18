@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DatabaseConfig {
     pub username: String,
     pub password: String,
@@ -19,6 +19,18 @@ impl DatabaseConfig {
             self.port,
             self.database
         )
+    }
+}
+
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseConfig")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .finish()
     }
 }
 

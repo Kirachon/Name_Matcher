@@ -163,3 +163,42 @@ With DB2_* set, the application connects to two independent MySQL pools and matc
 
 If you use or extend this tool, please credit Matthias Tangonan and consider contributing improvements back via pull requests.
 
+
+
+---
+
+## Performance Tuning and Auto-Optimization
+
+The GUI now provides an Auto Optimize button (Advanced section) that:
+- Detects available RAM and computes an adaptive StreamingConfig (batch_size, flush_every)
+- Suggests connection pool size from CPU cores (defaults to min(32, 2 x cores))
+- Picks Streaming mode for Algorithms 1/2, and In‑Memory for Fuzzy
+- Adjusts GPU memory budget suggestion (if enabled)
+
+Notes:
+- Streaming mode is recommended for large tables and low‑memory systems
+- Fuzzy (Algorithm 3) is In‑Memory only; use CSV output for full detail
+
+### Required Database Indexes
+For best performance, ensure the following indexes exist on both tables:
+- PRIMARY KEY or unique index on `id`
+- BTREE indexes on: `last_name`, `first_name`, `birthdate`
+- Optional but helpful for partitioning strategies: prefix/initial indexes on `last_name` and `first_name` (e.g., first character), or a computed birth year column
+
+Example (MySQL):
+```
+ALTER TABLE people ADD INDEX idx_last_name(last_name),
+                   ADD INDEX idx_first_name(first_name),
+                   ADD INDEX idx_birthdate(birthdate);
+```
+
+### Connection Pool Sizing
+- Default pool size (when not overridden) is derived from CPU cores: `min(32, 2 x cores)`
+- Override via env: `NAME_MATCHER_POOL_SIZE`, `NAME_MATCHER_POOL_MIN`
+
+### Streaming Configuration
+- Adaptive batch size is computed from available memory and clamped to [5,000; 100,000]
+- Export writers flush every ≈ 10% of the batch (min 1,000)
+- Checkpoint files (`.nmckpt`) are written next to output files to enable resume
+
+---
