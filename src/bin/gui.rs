@@ -1,3 +1,7 @@
+// SRS-II Name Matching Application GUI
+// Creator/Author: Matthias Tangonan
+// This file implements the desktop GUI using eframe/egui.
+
 use eframe::egui::{self, ComboBox, Context, ProgressBar, TextEdit};
 use eframe::{App, Frame, NativeOptions};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -142,7 +146,7 @@ impl Default for GuiApp {
 
 impl GuiApp {
     fn ui_top(&mut self, ui: &mut egui::Ui) {
-        ui.heading("🔎 Name Matcher — Desktop");
+        ui.heading("🔎 SRS-II Name Matching Application");
         ui.separator();
         ui.label("Database Connection");
         ui.horizontal(|ui| {
@@ -701,7 +705,7 @@ impl App for GuiApp {
 fn main() -> eframe::Result<()> {
     let opts = NativeOptions::default();
     eframe::run_native(
-        "Name Matcher",
+        "SRS-II Name Matching Application",
         opts,
         Box::new(|_cc| Ok::<Box<dyn App>, Box<(dyn std::error::Error + Send + Sync + 'static)>>(Box::new(GuiApp::default()))),
     )
