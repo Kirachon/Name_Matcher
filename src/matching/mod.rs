@@ -4,7 +4,9 @@ use crate::metrics::memory_stats_mb;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
-use strsim::{levenshtein, jaro, jaro_winkler};
+use strsim::{levenshtein, jaro_winkler};
+use rphonetic::{DoubleMetaphone, Encoder};
+use unicode_normalization::UnicodeNormalization;
 
 fn normalize_simple(s: &str) -> String {
     s.trim().to_lowercase().replace('.', "").replace('-', " ")
@@ -17,16 +19,93 @@ fn sim_levenshtein_pct(a: &str, b: &str) -> f64 {
     (1.0 - (dist as f64 / max_len as f64)) * 100.0
 }
 
-fn fuzzy_score_names(n1_first: &str, n1_mid: Option<&str>, n1_last: &str, n2_first: &str, n2_mid: Option<&str>, n2_last: &str) -> (f64, &'static str) {
-    let name1 = normalize_simple(&format!("{} {} {}", n1_first, n1_mid.unwrap_or(""), n1_last));
-    let name2 = normalize_simple(&format!("{} {} {}", n2_first, n2_mid.unwrap_or(""), n2_last));
-    let lev = sim_levenshtein_pct(&name1, &name2);
-    let jr = jaro(&name1, &name2) * 100.0;
-    let jw = jaro_winkler(&name1, &name2) * 100.0;
-    let score = lev.max(jr).max(jw);
-    let label = if score >= 95.0 { "Auto-Match" } else if score >= 85.0 { "Review" } else { "Reject" };
-    (score, label)
+fn normalize_for_phonetic(s: &str) -> String {
+    // Lowercase, decompose diacritics, keep ASCII letters and single spaces; map a few common non-ASCII
+    let s = s.trim().to_lowercase();
+    let mut out = String::with_capacity(s.len());
+    for ch in s.nfd() {
+        if ch.is_ascii_alphabetic() {
+            out.push(ch);
+        } else if ch.is_ascii_whitespace() {
+            if !out.ends_with(' ') { out.push(' '); }
+        } else {
+            match ch {
+                'ß' => out.push_str("ss"),
+                'æ' | 'ǽ' => out.push_str("ae"),
+                'ø' => out.push('o'),
+                'đ' => out.push('d'),
+                _ => {}
+            }
+        }
+    }
+    out.trim().to_string()
 }
+
+fn metaphone_pct(a: &str, b: &str) -> f64 {
+    let sa = normalize_for_phonetic(a);
+    let sb = normalize_for_phonetic(b);
+    if sa.is_empty() || sb.is_empty() { return 0.0; }
+
+    // Protect against panics inside rphonetic by catching unwinds
+    let ra = std::panic::catch_unwind(|| DoubleMetaphone::default().encode(&sa));
+    let rb = std::panic::catch_unwind(|| DoubleMetaphone::default().encode(&sb));
+    let (ra_s, rb_s) = match (ra, rb) {
+        (Ok(ra), Ok(rb)) => (ra.to_string(), rb.to_string()),
+        _ => {
+            log::warn!("DoubleMetaphone panicked on inputs: {:?} / {:?}", a, b);
+            return 0.0;
+        }
+    };
+    if !ra_s.is_empty() && ra_s == rb_s { 100.0 } else { 0.0 }
+}
+
+fn fuzzy_compare_names_new(n1_first: &str, n1_mid: Option<&str>, n1_last: &str, n2_first: &str, n2_mid: Option<&str>, n2_last: &str) -> Option<(f64, String)> {
+    let full1 = normalize_simple(&format!("{} {} {}", n1_first, n1_mid.unwrap_or(""), n1_last));
+    let full2 = normalize_simple(&format!("{} {} {}", n2_first, n2_mid.unwrap_or(""), n2_last));
+
+    let lev = sim_levenshtein_pct(&full1, &full2);
+    let jw = jaro_winkler(&full1, &full2) * 100.0;
+    let mp = metaphone_pct(&full1, &full2);
+
+    // Direct match
+    if full1 == full2 {
+        return Some((100.0, "DIRECT MATCH".to_string()));
+    }
+
+    // Case 1
+    if lev >= 85.0 && jw >= 85.0 && (mp - 100.0).abs() < f64::EPSILON {
+        let avg = (lev + jw + mp) / 3.0;
+        return Some((avg, "CASE 1".to_string()));
+    }
+
+    // Case 2
+    let mut pass = 0;
+    if lev >= 85.0 { pass += 1; }
+    if jw >= 85.0 { pass += 1; }
+    if (mp - 100.0).abs() < f64::EPSILON { pass += 1; }
+    if pass >= 2 {
+        let avg = (lev + jw + mp) / 3.0;
+        // Case 3 refinement
+        if avg >= 88.0 {
+            let ld_first = levenshtein(&normalize_simple(n1_first), &normalize_simple(n2_first)) as usize;
+            let ld_last = levenshtein(&normalize_simple(n1_last), &normalize_simple(n2_last)) as usize;
+            let ld_mid = levenshtein(&normalize_simple(n1_mid.unwrap_or("")), &normalize_simple(n2_mid.unwrap_or(""))) as usize;
+            if ld_first <= 2 && ld_last <= 2 && ld_mid <= 2 {
+                return Some((avg, "CASE 3".to_string()));
+            }
+        }
+        return Some((avg, "CASE 2".to_string()));
+    }
+
+    None
+}
+
+fn compare_persons_new(p1: &Person, p2: &Person) -> Option<(f64, String)> {
+    if p1.birthdate != p2.birthdate { return None; }
+    fuzzy_compare_names_new(&p1.first_name, p1.middle_name.as_deref(), &p1.last_name,
+                            &p2.first_name, p2.middle_name.as_deref(), &p2.last_name)
+}
+
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MatchingAlgorithm { IdUuidYasIsMatchedInfnbd, IdUuidYasIsMatchedInfnmnbd, Fuzzy }
@@ -138,15 +217,14 @@ where F: Fn(ProgressUpdate) + Sync,
                     }
                     MatchingAlgorithm::Fuzzy => {
                         if p1.birthdate == p2.birthdate {
-                            let (score, label) = fuzzy_score_names(
+                            if let Some((score, label)) = fuzzy_compare_names_new(
                                 &p1.first_name,
                                 p1.middle_name.as_deref(),
                                 &p1.last_name,
                                 &p2.first_name,
                                 p2.middle_name.as_deref(),
                                 &p2.last_name,
-                            );
-                            if score >= 85.0 {
+                            ) {
                                 Some(MatchPair {
                                     person1: to_original(p1, table1),
                                     person2: to_original(p2, table2),
@@ -524,6 +602,14 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert!(r[0].confidence > 0.85);
     }
+    #[test]
+    fn metaphone_handles_unicode_without_panic() {
+        let _ = metaphone_pct("JO\u{2229}N", "JOHN");
+        let _ = metaphone_pct("Jos\u{00e9}", "Jose");
+        let _ = metaphone_pct("M\u{00fc}ller", "Muller");
+        let _ = metaphone_pct("\u{738b}\u{5c0f}\u{660e}", "Wang Xiaoming");
+    }
+
 
 }
 
@@ -573,9 +659,22 @@ async fn build_index(pool: &MySqlPool, table: &str, algo: MatchingAlgorithm, mut
     Ok(map)
 }
 
-#[derive(Clone, Copy)]
-pub struct StreamingConfig { pub batch_size: i64, pub memory_soft_min_mb: u64 }
-impl Default for StreamingConfig { fn default() -> Self { Self { batch_size: 50_000, memory_soft_min_mb: 800 } } }
+#[derive(Clone, Debug)]
+pub struct StreamingConfig {
+    pub batch_size: i64,
+    pub memory_soft_min_mb: u64,
+    // new fields for robustness on millions of records
+    pub flush_every: usize,            // flush output every N matches
+    pub resume: bool,                  // resume from checkpoint if exists
+    pub retry_max: u32,                // DB retry attempts per chunk
+    pub retry_backoff_ms: u64,         // base backoff between retries
+    pub checkpoint_path: Option<String>,
+}
+impl Default for StreamingConfig {
+    fn default() -> Self {
+        Self { batch_size: 50_000, memory_soft_min_mb: 800, flush_every: 10_000, resume: true, retry_max: 5, retry_backoff_ms: 500, checkpoint_path: None }
+    }
+}
 
 #[derive(Clone)]
 pub struct StreamControl { pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>, pub pause: std::sync::Arc<std::sync::atomic::AtomicBool> }
@@ -583,6 +682,7 @@ pub struct StreamControl { pub cancel: std::sync::Arc<std::sync::atomic::AtomicB
 pub async fn stream_match_csv<F>(pool: &MySqlPool, table1: &str, table2: &str, algo: MatchingAlgorithm, mut on_match: F, cfg: StreamingConfig, on_progress: impl Fn(ProgressUpdate), ctrl: Option<StreamControl>) -> Result<usize>
 where F: FnMut(&MatchPair) -> Result<()>
 {
+    use crate::util::checkpoint::{load_checkpoint, save_checkpoint, remove_checkpoint, StreamCheckpoint};
     if matches!(algo, MatchingAlgorithm::Fuzzy) {
         anyhow::bail!("Fuzzy algorithm is currently supported only in in-memory mode (CSV). Use algorithm=3 with CSV format.");
     }
@@ -592,6 +692,7 @@ where F: FnMut(&MatchPair) -> Result<()>
     let (inner_table, outer_table, total) = if c2 <= c1 { (table2, table1, c1) } else { (table1, table2, c2) };
     let mut batch = cfg.batch_size.max(10_000);
     let start = Instant::now();
+
     // Progress: indexing start
     let mems = memory_stats_mb();
     on_progress(ProgressUpdate { processed: 0, total: total as usize, percent: 0.0, eta_secs: 0, mem_used_mb: mems.used_mb, mem_avail_mb: mems.avail_mb, stage: "indexing", batch_size_current: Some(batch), gpu_total_mb: 0, gpu_free_mb: 0, gpu_active: false });
@@ -599,14 +700,43 @@ where F: FnMut(&MatchPair) -> Result<()>
     let mems2 = memory_stats_mb();
     on_progress(ProgressUpdate { processed: 0, total: total as usize, percent: 0.0, eta_secs: 0, mem_used_mb: mems2.used_mb, mem_avail_mb: mems2.avail_mb, stage: "indexing_done", batch_size_current: Some(batch), gpu_total_mb: 0, gpu_free_mb: 0, gpu_active: false });
 
-    let mut offset: i64 = 0; let mut written = 0usize; let mut processed = 0usize;
-    let mem0 = memory_stats_mb();
+    // Resume support: detect checkpoint
+    let mut offset: i64 = 0;
+    if cfg.resume {
+        if let Some(p) = cfg.checkpoint_path.as_ref() {
+            if let Some(cp) = load_checkpoint(p) {
+                if cp.db == "" || (cp.table_inner == inner_table && cp.table_outer == outer_table && cp.algorithm == format!("{:?}", algo)) {
+                    offset = cp.next_offset.min(total);
+                    batch = cp.batch_size.max(10_000);
+                }
+            }
+        }
+    }
+
+    let mut written = 0usize; let mut processed = 0usize;
+    let mut last_chunk_start = Instant::now();
+
     while offset < total {
         if let Some(c) = &ctrl { if c.cancel.load(std::sync::atomic::Ordering::Relaxed) { break; } while c.pause.load(std::sync::atomic::Ordering::Relaxed) { tokio::time::sleep(std::time::Duration::from_millis(100)).await; } }
-        // adjust batch under memory pressure
+        // adaptive batch: memory based decrease, throughput-based increase
         let mem = memory_stats_mb();
         if mem.avail_mb < cfg.memory_soft_min_mb && batch > 10_000 { batch = (batch / 2).max(10_000); }
-        let rows = fetch_person_rows_chunk(pool, outer_table, offset, batch).await?;
+
+        // fetch with retry
+        let mut tries = 0u32;
+        let rows: Vec<Person> = loop {
+            match fetch_person_rows_chunk(pool, outer_table, offset, batch).await {
+                Ok(v) => break v,
+                Err(e) => {
+                    tries += 1;
+                    if tries > cfg.retry_max { return Err(e); }
+                    let backoff = cfg.retry_backoff_ms * (1u64 << (tries.min(5)-1));
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                    continue;
+                }
+            }
+        };
+
         for p in rows.iter() {
             if let Some(c) = &ctrl { if c.cancel.load(std::sync::atomic::Ordering::Relaxed) { break; } while c.pause.load(std::sync::atomic::Ordering::Relaxed) { tokio::time::sleep(std::time::Duration::from_millis(50)).await; } }
             let n = normalize_person(p);
@@ -614,17 +744,207 @@ where F: FnMut(&MatchPair) -> Result<()>
             if let Some(cands) = index.get(&k) {
                 for q in cands {
                     let n2 = normalize_person(q);
-                    let ok = match algo { MatchingAlgorithm::IdUuidYasIsMatchedInfnbd => matches_algo1(&n, &n2), MatchingAlgorithm::IdUuidYasIsMatchedInfnmnbd => matches_algo2(&n, &n2), MatchingAlgorithm::Fuzzy => false /* unreachable due to early bail */ };
+                    let ok = match algo { MatchingAlgorithm::IdUuidYasIsMatchedInfnbd => matches_algo1(&n, &n2), MatchingAlgorithm::IdUuidYasIsMatchedInfnmnbd => matches_algo2(&n, &n2), MatchingAlgorithm::Fuzzy => false };
                     if ok { let pair = if inner_table == table2 { to_pair(p, q, algo, &n, &n2) } else { to_pair(q, p, algo, &n2, &n) }; on_match(&pair)?; written += 1; }
                 }
             }
         }
+
         offset += batch; processed = (processed + rows.len()).min(total as usize);
+
+        // save checkpoint
+        if let Some(p) = cfg.checkpoint_path.as_ref() {
+            let _ = save_checkpoint(p, &StreamCheckpoint {
+                db: String::new(),
+                table_inner: inner_table.to_string(),
+                table_outer: outer_table.to_string(),
+                algorithm: format!("{:?}", algo),
+                batch_size: batch,
+                next_offset: offset,
+                total_outer: total,
+                partition_idx: 0,
+                partition_name: "all".into(),
+                updated_utc: chrono::Utc::now().to_rfc3339(),
+            });
+        }
+
+        // progress update
         let frac = (processed as f32 / total as f32).clamp(0.0, 1.0);
         let eta = if frac > 0.0 { (start.elapsed().as_secs_f32() * (1.0 - frac) / frac) as u64 } else { 0 };
         let memx = memory_stats_mb();
         on_progress(ProgressUpdate { processed, total: total as usize, percent: frac * 100.0, eta_secs: eta, mem_used_mb: memx.used_mb, mem_avail_mb: memx.avail_mb, stage: "streaming", batch_size_current: Some(batch), gpu_total_mb: 0, gpu_free_mb: 0, gpu_active: false });
+
+        // adaptive increase if fast
+        let dur = last_chunk_start.elapsed();
+        if dur.as_millis() > 0 { // if chunk was quick and memory is plentiful, increase
+            if memx.avail_mb > cfg.memory_soft_min_mb * 2 && dur < std::time::Duration::from_secs(1) {
+                let new_batch = (batch as f64 * 1.5) as i64;
+                batch = new_batch.min(200_000).max(10_000);
+            }
+        }
+        last_chunk_start = Instant::now();
+        // allow runtime to schedule
+        tokio::task::yield_now().await;
     }
-    let _mem_end = memory_stats_mb(); let _ = mem0; // could log delta
+
+    if let Some(p) = cfg.checkpoint_path.as_ref() { remove_checkpoint(p); }
     Ok(written)
 }
+
+
+// --- Partitioned streaming (multi-pass) ---
+use crate::util::partition::{PartitionStrategy, DefaultPartition};
+use crate::db::schema::{get_person_count_where, get_person_rows_where, fetch_person_rows_chunk_where};
+use crate::models::ColumnMapping;
+
+#[derive(Clone, Debug)]
+pub struct PartitioningConfig {
+    pub enabled: bool,
+    pub strategy: String, // e.g., "last_initial" | "birthyear5"
+}
+impl Default for PartitioningConfig { fn default() -> Self { Self { enabled: false, strategy: "last_initial".into() } } }
+
+pub async fn stream_match_csv_partitioned<F>(
+    pool: &MySqlPool,
+    table1: &str,
+    table2: &str,
+    algo: MatchingAlgorithm,
+    mut on_match: F,
+    cfg: StreamingConfig,
+    on_progress: impl Fn(ProgressUpdate),
+    ctrl: Option<StreamControl>,
+    mapping1: Option<&ColumnMapping>,
+    mapping2: Option<&ColumnMapping>,
+    part_cfg: PartitioningConfig,
+) -> Result<usize>
+where F: FnMut(&MatchPair) -> Result<()>
+{
+    use crate::util::checkpoint::{load_checkpoint, save_checkpoint, remove_checkpoint, StreamCheckpoint};
+    let strat: Box<dyn PartitionStrategy + Send + Sync> = match part_cfg.strategy.as_str() {
+        "birthyear5" => DefaultPartition::BirthYear5.build(),
+        _ => DefaultPartition::LastInitial.build(),
+    };
+    let parts1 = strat.partitions(mapping1);
+    let parts2 = strat.partitions(mapping2);
+    if parts1.len() != parts2.len() { anyhow::bail!("Partition strategy produced mismatched partition counts for the two tables"); }
+
+    // resume state
+    let mut start_part: usize = 0;
+    let mut offset: i64 = 0;
+    let mut batch = cfg.batch_size.max(10_000);
+    if cfg.resume {
+        if let Some(pth) = cfg.checkpoint_path.as_ref() {
+            if let Some(cp) = load_checkpoint(pth) {
+                start_part = (cp.partition_idx as isize).max(0) as usize;
+                offset = cp.next_offset;
+                batch = cp.batch_size.max(10_000);
+            }
+        }
+    }
+
+    let total_parts = parts1.len();
+    let mut total_written = 0usize;
+    for pi in start_part..total_parts {
+        let p1 = &parts1[pi];
+        let p2 = &parts2[pi];
+        // Index inner table for this partition
+        let c1 = get_person_count_where(pool, table1, &p1.where_sql, &p1.binds).await?;
+        let c2 = get_person_count_where(pool, table2, &p2.where_sql, &p2.binds).await?;
+        let inner_is_t2 = c2 <= c1;
+        let (inner_table, inner_where, inner_binds, inner_map) = if inner_is_t2 { (table2, &p2.where_sql, &p2.binds, mapping2) } else { (table1, &p1.where_sql, &p1.binds, mapping1) };
+        let (outer_table, outer_where, outer_binds, outer_map) = if inner_is_t2 { (table1, &p1.where_sql, &p1.binds, mapping1) } else { (table2, &p2.where_sql, &p2.binds, mapping2) };
+        let total_outer = if inner_is_t2 { c1 } else { c2 };
+
+        let mems = memory_stats_mb();
+        on_progress(ProgressUpdate { processed: 0, total: total_outer as usize, percent: 0.0, eta_secs: 0, mem_used_mb: mems.used_mb, mem_avail_mb: mems.avail_mb, stage: "indexing", batch_size_current: Some(batch), gpu_total_mb: 0, gpu_free_mb: 0, gpu_active: false });
+        let inner_rows = get_person_rows_where(pool, inner_table, inner_where, inner_binds, inner_map).await?;
+        let mems2 = memory_stats_mb();
+        on_progress(ProgressUpdate { processed: 0, total: total_outer as usize, percent: 0.0, eta_secs: 0, mem_used_mb: mems2.used_mb, mem_avail_mb: mems2.avail_mb, stage: "indexing_done", batch_size_current: Some(batch), gpu_total_mb: 0, gpu_free_mb: 0, gpu_active: false });
+
+        // Precompute normalized inner and group by birthdate to bound comparisons
+        use std::collections::HashMap as Map;
+        let norm_inner: Vec<NormalizedPerson> = inner_rows.iter().map(normalize_person).collect();
+        let mut by_date: Map<chrono::NaiveDate, Vec<usize>> = Map::new();
+        for (i, n) in norm_inner.iter().enumerate() { by_date.entry(n.birthdate).or_default().push(i); }
+
+        // Optional GPU: we'll attempt it when feature is enabled; else CPU fallback
+
+        let start_time = Instant::now();
+        let mut processed = 0usize;
+        if pi != start_part { offset = 0; }
+        while offset < total_outer {
+            if let Some(c) = &ctrl { if c.cancel.load(std::sync::atomic::Ordering::Relaxed) { break; } while c.pause.load(std::sync::atomic::Ordering::Relaxed) { tokio::time::sleep(std::time::Duration::from_millis(100)).await; } }
+            let mem = memory_stats_mb();
+            if mem.avail_mb < cfg.memory_soft_min_mb && batch > 10_000 { batch = (batch / 2).max(10_000); }
+
+            // fetch chunk with WHERE
+            let mut tries = 0u32;
+            let rows: Vec<Person> = loop {
+                match fetch_person_rows_chunk_where(pool, outer_table, offset, batch, outer_where, outer_binds, outer_map).await {
+                    Ok(v) => break v,
+                    Err(e) => { tries += 1; if tries > cfg.retry_max { return Err(e); } let backoff = cfg.retry_backoff_ms * (1u64 << (tries.min(5)-1)); tokio::time::sleep(std::time::Duration::from_millis(backoff)).await; }
+                }
+            };
+
+            // Try GPU first (per-chunk) if available; fallback to CPU if disabled/failed
+            let mut gpu_done = false;
+            #[cfg(feature = "gpu")]
+            {
+                let opts = MatchOptions { backend: ComputeBackend::Gpu, gpu: Some(GpuConfig { device_id: None, mem_budget_mb: 512 }), progress: ProgressConfig::default() };
+                let progress_cb = |u: ProgressUpdate| { on_progress(u); };
+                match gpu::match_fuzzy_gpu(&rows, &inner_rows, opts, &progress_cb) {
+                    Ok(mut vec_pairs) => {
+                        for pair in vec_pairs.drain(..) {
+                            if let Some((score, label)) = compare_persons_new(&pair.person1, &pair.person2) {
+                                let mut updated = pair;
+                                updated.confidence = (score/100.0) as f32;
+                                updated.matched_fields = vec!["fuzzy".into(), label, "birthdate".into()];
+                                on_match(&updated)?; total_written += 1;
+                            }
+                        }
+                        gpu_done = true;
+                    }
+                    Err(e) => { log::warn!("GPU fuzzy failed in partition; falling back to CPU: {}", e); }
+                }
+            }
+
+            if !gpu_done {
+                // CPU fallback: candidate window by exact birthdate
+                for p in rows.iter() {
+                    let n = normalize_person(p);
+                    if let Some(cand_idx) = by_date.get(&n.birthdate) {
+
+
+                        for &i2 in cand_idx {
+                            let n2 = &norm_inner[i2];
+                            // quick initial filter: last initial must match if not enforced by strategy
+                            if part_cfg.strategy != "last_initial" {
+                                let li1 = n.last_name.chars().next().unwrap_or('\0').to_ascii_uppercase();
+                                let li2 = n2.last_name.chars().next().unwrap_or('\0').to_ascii_uppercase();
+                                if li1 != li2 { continue; }
+                            }
+                            if let Some((score, label)) = fuzzy_compare_names_new(&n.first_name, n.middle_name.as_deref(), &n.last_name, &n2.first_name, n2.middle_name.as_deref(), &n2.last_name) {
+                                let q = &inner_rows[i2];
+                                let pair = MatchPair { person1: if inner_is_t2 { p.clone() } else { q.clone() }, person2: if inner_is_t2 { q.clone() } else { p.clone() }, confidence: (score/100.0) as f32, matched_fields: vec!["fuzzy".into(), label, "birthdate".into()], is_matched_infnbd: false, is_matched_infnmnbd: false };
+                                on_match(&pair)?; total_written += 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            offset += batch; processed = (processed + rows.len()).min(total_outer as usize);
+            if let Some(pth) = cfg.checkpoint_path.as_ref() {
+                let _ = save_checkpoint(pth, &StreamCheckpoint { db: String::new(), table_inner: inner_table.to_string(), table_outer: outer_table.to_string(), algorithm: format!("{:?}", algo), batch_size: batch, next_offset: offset, total_outer, partition_idx: pi as i32, partition_name: p1.name.clone(), updated_utc: chrono::Utc::now().to_rfc3339() });
+            }
+            let frac = (processed as f32 / total_outer as f32).clamp(0.0, 1.0);
+            let eta = if frac > 0.0 { (start_time.elapsed().as_secs_f32() * (1.0 - frac) / frac) as u64 } else { 0 };
+            let memx = memory_stats_mb();
+            on_progress(ProgressUpdate { processed, total: total_outer as usize, percent: frac * 100.0, eta_secs: eta, mem_used_mb: memx.used_mb, mem_avail_mb: memx.avail_mb, stage: if gpu_done { "gpu_kernel" } else { "streaming" }, batch_size_current: Some(batch), gpu_total_mb: 0, gpu_free_mb: 0, gpu_active: gpu_done });
+            tokio::task::yield_now().await;
+        }
+    }
+    if let Some(pth) = cfg.checkpoint_path.as_ref() { remove_checkpoint(pth); }
+    Ok(total_written)
+}
+
