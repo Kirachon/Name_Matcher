@@ -63,6 +63,9 @@ struct GuiApp {
     use_gpu: bool,
     gpu_mem_mb: String,
 
+    // Storage and system hints
+    ssd_storage: bool,
+
     running: bool,
     progress: f32,
     eta_secs: u64,
@@ -121,6 +124,7 @@ impl Default for GuiApp {
             mem_thresh: "800".into(),
             use_gpu: false,
             gpu_mem_mb: "512".into(),
+            ssd_storage: false,
             running: false,
             progress: 0.0,
             eta_secs: 0,
@@ -253,6 +257,13 @@ impl GuiApp {
         ui.collapsing("Advanced", |ui| {
             ui.horizontal(|ui| {
                 ui.label("Pool size").on_hover_text("Max connections in SQL pool"); ui.add(TextEdit::singleline(&mut self.pool_size).desired_width(60.0));
+            ui.horizontal(|ui| {
+                let mem = name_matcher::metrics::memory_stats_mb();
+                let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+                ui.label(format!("System: {} cores | free mem {} MB", cores, mem.avail_mb));
+                ui.checkbox(&mut self.ssd_storage, "SSD storage").on_hover_text("Optimize flush frequency for SSD (larger buffered writes)");
+            });
+
                 ui.label("Batch size").on_hover_text("Rows fetched per chunk in streaming mode"); ui.add(TextEdit::singleline(&mut self.batch_size).desired_width(80.0));
                 ui.label("Mem thresh MB").on_hover_text("Soft minimum free memory before reducing batch size"); ui.add(TextEdit::singleline(&mut self.mem_thresh).desired_width(80.0));
             });
@@ -399,9 +410,11 @@ impl GuiApp {
         self.ctrl_cancel = Some(cancel_flag.clone());
         self.ctrl_pause = Some(pause_flag.clone());
 
+        let ssd_hint = self.ssd_storage;
         thread::spawn(move || {
             let tx_for_async = tx.clone();
             let ctrl = Some(StreamControl { cancel: cancel_flag.clone(), pause: pause_flag.clone() });
+
 
             let rt = tokio::runtime::Runtime::new().unwrap();
             let res: Result<(usize,usize,usize,String)> = rt.block_on(async move {
@@ -419,6 +432,13 @@ impl GuiApp {
                 scfg.checkpoint_path = Some(format!("{}.nmckpt", path));
                 match fmt {
                     FormatSel::Csv => {
+                // Tune flush frequency based on storage hint
+                if ssd_hint {
+                    scfg.flush_every = (batch as usize / 5).max(1000);
+                } else {
+                    scfg.flush_every = (batch as usize / 10).max(1000);
+                }
+
                         let mut use_streaming = match mode { ModeSel::Streaming => true, ModeSel::InMemory => false, ModeSel::Auto => true };
                         if matches!(algo, MatchingAlgorithm::Fuzzy) { use_streaming = false; let _ = tx_for_async.send(Msg::Info("Fuzzy uses in-memory mode (streaming disabled)".into())); }
                         if use_streaming {
