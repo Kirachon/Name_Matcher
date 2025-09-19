@@ -79,30 +79,39 @@ fn categorize_error(msg: &str) -> ErrorCategory {
 fn categorize_error_with(sqlstate: Option<&str>, msg: &str) -> ErrorCategory {
     if let Some(state) = sqlstate {
         match state {
+            // Schema/table
             "42S02" => return ErrorCategory::TableValidation, // table doesn't exist
             "42S22" => return ErrorCategory::SchemaValidation, // column not found
+            // Privilege / access
             "28000" => return ErrorCategory::DbConnection,     // access denied
             "42000" => {
                 let m = msg.to_ascii_lowercase();
                 if m.contains("permission") || m.contains("denied") { return ErrorCategory::TableValidation; }
-                return ErrorCategory::Configuration; // syntax or config
+                return ErrorCategory::Configuration; // syntax or access rule violation
             }
+            // Connection errors
+            "08001" | "08004" | "08S01" => return ErrorCategory::DbConnection,
+            // Timeouts
+            "HYT00" => return ErrorCategory::ResourceConstraint,
+            // Data problems
+            "22001" | "22003" | "22007" => return ErrorCategory::DataFormat, // truncation, out of range, invalid datetime
+            // Integrity / FK
             "23000" => return ErrorCategory::DataFormat, // integrity constraint violation
             _ => {}
         }
     }
     let m = msg.to_ascii_lowercase();
-    if m.contains("access denied") || m.contains("authentication") || m.contains("unknown database") || m.contains("host") && m.contains("unreach") || m.contains("timed out") {
+    if m.contains("access denied") || m.contains("authentication") || m.contains("unknown database") || (m.contains("host") && m.contains("unreach")) || m.contains("timed out") || m.contains("connection") && m.contains("fail") {
         ErrorCategory::DbConnection
-    } else if m.contains("doesn't exist") || m.contains("no such table") || m.contains("table") && m.contains("permission") {
+    } else if m.contains("doesn't exist") || m.contains("no such table") || (m.contains("table") && m.contains("permission")) {
         ErrorCategory::TableValidation
-    } else if m.contains("unknown column") || m.contains("column") && m.contains("type") || m.contains("index") && m.contains("missing") {
+    } else if m.contains("unknown column") || (m.contains("column") && m.contains("type")) || (m.contains("index") && m.contains("missing")) {
         ErrorCategory::SchemaValidation
-    } else if m.contains("incorrect date value") || m.contains("invalid date") || m.contains("parse") && m.contains("date") || m.contains("null") && m.contains("required") || m.contains("truncation") {
+    } else if m.contains("incorrect date value") || m.contains("invalid date") || (m.contains("parse") && m.contains("date")) || (m.contains("null") && m.contains("required")) || m.contains("truncation") || m.contains("data too long") || m.contains("foreign key constraint fails") {
         ErrorCategory::DataFormat
-    } else if m.contains("out of memory") || m.contains("memory") && m.contains("insufficient") || m.contains("disk") && m.contains("space") {
+    } else if m.contains("out of memory") || (m.contains("memory") && m.contains("insufficient")) || (m.contains("disk") && m.contains("space")) || m.contains("lock wait timeout") {
         ErrorCategory::ResourceConstraint
-    } else if m.contains("invalid") && m.contains("environment") || m.contains("env") && m.contains("invalid") || m.contains("malformed") || m.contains("configuration") {
+    } else if (m.contains("invalid") && m.contains("environment")) || (m.contains("env") && m.contains("invalid")) || m.contains("malformed") || m.contains("configuration") || m.contains("syntax error") {
         ErrorCategory::Configuration
     } else {
         ErrorCategory::Unknown
@@ -175,6 +184,9 @@ struct GuiApp {
     error_events: Vec<DiagEvent>,
     report_format: ReportFormat,
     last_action: String,
+    // Advanced diagnostics
+    schema_analysis_enabled: bool,
+    log_buffer: Vec<String>,
 
     ctrl_cancel: Option<Arc<AtomicBool>>,
     ctrl_pause: Option<Arc<AtomicBool>>,
@@ -237,6 +249,8 @@ impl Default for GuiApp {
             error_events: Vec::new(),
             report_format: ReportFormat::Text,
             last_action: "idle".into(),
+            schema_analysis_enabled: false,
+            log_buffer: Vec::with_capacity(200),
 
             ctrl_cancel: None,
             ctrl_pause: None,
@@ -363,6 +377,9 @@ impl GuiApp {
             ui.separator();
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.use_gpu, "Use GPU (CUDA)").on_hover_text("Enable CUDA acceleration for Fuzzy (Algorithm 3). Falls back to CPU if unavailable.");
+                if !cfg!(feature = "gpu") {
+                    ui.label("Note: This build was compiled without GPU feature; enable with `cargo run --features gpu`.");
+                }
                 ui.label("GPU Mem Budget (MB)"); ui.add(TextEdit::singleline(&mut self.gpu_mem_mb).desired_width(80.0));
                 if ui.button("Auto Optimize").clicked() {
                     let mem = name_matcher::metrics::memory_stats_mb();
@@ -409,13 +426,15 @@ impl GuiApp {
                         ui.selectable_value(&mut self.report_format, ReportFormat::Text, "TXT");
                         ui.selectable_value(&mut self.report_format, ReportFormat::Json, "JSON");
                     });
+                ui.checkbox(&mut self.schema_analysis_enabled, "Include schema analysis in report")
+                    .on_hover_text("Runs INFORMATION_SCHEMA queries to suggest missing columns/types/indexes; metadata-only, no row data");
                 if ui.button("Export Error Report").on_hover_text("Export a sanitized diagnostic report for technical support").clicked() {
                     match self.export_error_report() {
                         Ok(p) => { self.status = format!("Error report saved to {}", p); }
                         Err(e) => { self.status = format!("Failed to export report: {}", e); }
                     }
                 }
-                ui.label(format!("Errors captured: {}", self.error_events.len()));
+                ui.label(format!("Errors captured: {} (log tail {} entries)", self.error_events.len(), self.log_buffer.len()));
             }
         });
 
@@ -552,15 +571,18 @@ impl GuiApp {
 
                         let mut use_streaming = match mode { ModeSel::Streaming => true, ModeSel::InMemory => false, ModeSel::Auto => true };
                         if matches!(algo, MatchingAlgorithm::Fuzzy) { use_streaming = false; let _ = tx_for_async.send(Msg::Info("Fuzzy uses in-memory mode (streaming disabled)".into())); }
+                        if use_gpu && !cfg!(feature = "gpu") {
+                            let _ = tx_for_async.send(Msg::Info("GPU requested but this binary lacks GPU support; will run on CPU. Rebuild with --features gpu".into()));
+                        }
                         if use_streaming {
                             // GPU availability info (best-effort)
                             #[cfg(feature = "gpu")]
                             if use_gpu {
-                                if let Ok(dev) = cudarc::driver::CudaDevice::new(0) {
+                                if let Ok(ctx) = cudarc::driver::CudaContext::new(0) {
                                     let mut free: usize = 0; let mut total: usize = 0;
                                     unsafe { let _ = cudarc::driver::sys::cuMemGetInfo_v2(&mut free as *mut _ as *mut _, &mut total as *mut _ as *mut _); }
                                     let _ = tx_for_async.send(Msg::Info(format!("CUDA active | Free {} MB / Total {} MB", (free/1024/1024), (total/1024/1024))));
-                                    drop(dev);
+                                    drop(ctx);
                                 } else {
                                     let _ = tx_for_async.send(Msg::Info("CUDA requested but unavailable; falling back to CPU".into()));
                                 }
@@ -631,11 +653,11 @@ impl GuiApp {
                             // GPU availability info (best-effort)
                             #[cfg(feature = "gpu")]
                             if use_gpu {
-                                if let Ok(dev) = cudarc::driver::CudaDevice::new(0) {
+                                if let Ok(ctx) = cudarc::driver::CudaContext::new(0) {
                                     let mut free: usize = 0; let mut total: usize = 0;
                                     unsafe { let _ = cudarc::driver::sys::cuMemGetInfo_v2(&mut free as *mut _ as *mut _, &mut total as *mut _ as *mut _); }
                                     let _ = tx_for_async.send(Msg::Info(format!("CUDA active | Free {} MB / Total {} MB", (free/1024/1024), (total/1024/1024))));
-                                    drop(dev);
+                                    drop(ctx);
                                 } else {
                                     let _ = tx_for_async.send(Msg::Info("CUDA requested but unavailable; falling back to CPU".into()));
                                 }
@@ -823,11 +845,27 @@ impl GuiApp {
                     self.last_tick = Some(now);
                     self.last_processed_prev = self.processed;
                     self.status = format!("{} | {:.1}% | {} / {} recs | {:.0} rec/s", self.stage, u.percent, self.processed, self.total, self.rps);
+                    // log tail
+                    let line = format!("{} PROGRESS stage={} percent={:.1} processed={}/{} rps={:.0}", chrono::Utc::now().to_rfc3339(), self.stage, u.percent, self.processed, self.total, self.rps);
+                    self.log_buffer.push(line);
+                    if self.log_buffer.len()>200 { let drop = self.log_buffer.len()-200; self.log_buffer.drain(0..drop); }
                 }
-                Msg::Info(s) => { self.status = s; }
+                Msg::Info(s) => {
+                    self.status = s.clone();
+                    let line = format!("{} INFO {}", chrono::Utc::now().to_rfc3339(), s);
+                    self.log_buffer.push(line);
+                    if self.log_buffer.len()>200 { let drop = self.log_buffer.len()-200; self.log_buffer.drain(0..drop); }
+                }
                 Msg::Tables(v) => { self.tables = v; self.table1_idx = 0; if self.table1_idx >= self.tables.len() { self.table1_idx = 0; } self.status = format!("Loaded {} tables (DB1)", self.tables.len()); }
                 Msg::Tables2(v2) => { self.tables2 = v2; self.table2_idx = 0; if self.table2_idx >= self.tables2.len() { self.table2_idx = 0; } self.status = format!("Loaded {} tables (DB2)", self.tables2.len()); }
-                Msg::Done { a1, a2, csv, path } => { self.running = false; self.a1_count = a1; self.a2_count = a2; self.csv_count = csv; self.status = format!("Done. Output: {}", path); self.progress = 100.0; }
+                Msg::Done { a1, a2, csv, path } => {
+                    self.running = false; self.a1_count = a1; self.a2_count = a2; self.csv_count = csv; self.progress = 100.0;
+                    if self.use_gpu && matches!(self.algo, MatchingAlgorithm::Fuzzy) && self.gpu_total_mb == 0 {
+                        self.status = format!("Done (CPU fallback — no GPU activity detected). Output: {}", path);
+                    } else {
+                        self.status = format!("Done. Output: {}", path);
+                    }
+                }
                 Msg::Error(e) => {
                     self.running = false;
                     self.status = format!("Error: {}", e);
@@ -885,6 +923,15 @@ impl GuiApp {
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
         let mem = name_matcher::metrics::memory_stats_mb();
         let ver = env!("CARGO_PKG_VERSION");
+        let os = std::env::consts::OS; let arch = std::env::consts::ARCH;
+        // Collect selected environment variables with sanitization
+        let mut env_selected: Vec<(String,String)> = Vec::new();
+        for (k,v) in std::env::vars() {
+            if k.starts_with("SQLX_") || k=="RUST_LOG" || k=="RUST_BACKTRACE" {
+                let vv = if v.contains("mysql://") { v.replacen("mysql://", "mysql://[REDACTED]@", 1) } else { v.clone() };
+                env_selected.push((k, vv));
+            }
+        }
 
         let suggestions_for = |cat: ErrorCategory| -> Vec<&'static str> {
             match cat {
@@ -922,7 +969,7 @@ impl GuiApp {
             ReportFormat::Text => {
                 let mut out = String::new();
                 out.push_str(&format!("SRS-II Name Matching - Diagnostic Report\nVersion: {}\nTimestamp: {}\n\n", ver, Utc::now().to_rfc3339()));
-                out.push_str(&format!("System: cores={} | mem_avail={} MB\n", cores, mem.avail_mb));
+                out.push_str(&format!("System: os={} arch={} cores={} | mem_avail={} MB\n", os, arch, cores, mem.avail_mb));
                 let mode_str = match self.mode { ModeSel::Auto => "Auto", ModeSel::Streaming => "Streaming", ModeSel::InMemory => "InMemory" };
                 let fmt_str = match self.fmt { FormatSel::Csv => "CSV", FormatSel::Xlsx => "XLSX", FormatSel::Both => "Both" };
                 let algo_str = match self.algo { MatchingAlgorithm::IdUuidYasIsMatchedInfnbd => "Algo1", MatchingAlgorithm::IdUuidYasIsMatchedInfnmnbd => "Algo2", MatchingAlgorithm::Fuzzy => "Fuzzy" };
@@ -958,6 +1005,106 @@ impl GuiApp {
                     if !specific.is_empty() { out.push_str("Specific remediation:\n"); for s in &specific { out.push_str(&format!("  - {}\n", s)); } }
                     out.push_str("Remediation:\n"); for s in suggestions_for(evt.category) { out.push_str(&format!("  - {}\n", s)); }
                     out.push_str("\n");
+                    // Optional schema analysis
+                    if self.schema_analysis_enabled {
+                        let t1 = self.tables.get(self.table1_idx).cloned();
+                        let t2 = if self.enable_dual { self.tables2.get(self.table2_idx).cloned() } else { None };
+                        let host = self.host.clone(); let port = self.port.clone(); let user = self.user.clone(); let pass = self.pass.clone(); let dbname = self.db.clone();
+                        let host2 = self.host2.clone(); let port2 = self.port2.clone(); let user2 = self.user2.clone(); let pass2 = self.pass2.clone(); let dbname2 = self.db2.clone();
+                        let mut summary = String::new();
+                        let mut index_suggestions: Vec<String> = Vec::new();
+                        let mut grant_suggestions: Vec<String> = Vec::new();
+                        let mut charset_notes: Vec<String> = Vec::new();
+                        // derive hints from last error
+                        if let Some(last) = self.error_events.last() {
+                            let mm = last.message.to_ascii_lowercase() + "\n" + &last.chain.clone().unwrap_or_default().to_ascii_lowercase();
+                            if mm.contains("command denied") || mm.contains("access denied") { grant_suggestions.push(format!("GRANT SELECT ON `{}`.* TO '{}'@'%';", self.db, self.user)); }
+                            if mm.contains("incorrect string value") || mm.contains("collation") { charset_notes.push("Consider aligning character set/collation: ALTER TABLE `<db>.<table>` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;".into()); }
+                            if mm.contains("foreign key constraint fails") { charset_notes.push("Verify parent rows exist and consider indexing FK columns in child table to speed checks.".into()); }
+                        }
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        let res: anyhow::Result<()> = rt.block_on(async {
+                            let cfg1 = DatabaseConfig { host: host.clone(), port: port.parse().unwrap_or(3306), username: user.clone(), password: pass.clone(), database: dbname.clone() };
+                            let pool1 = make_pool_with_size(&cfg1, Some(4)).await?;
+                            if let Some(table) = t1.as_ref() {
+                                summary.push_str(&format!("[DB1:{}] Table `{}`\n", dbname, table));
+                                // Columns
+                                let cols = sqlx::query(
+                                    "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION"
+                                ).bind(&dbname).bind(table).fetch_all(&pool1).await?;
+                                let mut actual: std::collections::HashMap<String,(String,bool,Option<i64>)> = std::collections::HashMap::new();
+                                for row in cols {
+                                    use sqlx::Row;
+                                    let cname: String = row.get::<String,_>("COLUMN_NAME");
+                                    let dtype: String = row.get::<String,_>("DATA_TYPE");
+                                    let is_null: String = row.get::<String,_>("IS_NULLABLE");
+                                    let clen: Option<i64> = row.try_get::<i64,_>("CHARACTER_MAXIMUM_LENGTH").ok();
+                                    actual.insert(cname.to_lowercase(), (dtype.to_lowercase(), is_null == "YES", clen));
+                                }
+                                let expected = [
+                                    ("id","bigint", false, None),
+                                    ("uuid","varchar", false, Some(64)),
+                                    ("first_name","varchar", false, Some(255)),
+                                    ("middle_name","varchar", true, Some(255)),
+                                    ("last_name","varchar", false, Some(255)),
+                                    ("birthdate","date", false, None),
+                                ];
+                                for (name, ty, nullable, len) in expected {
+                                    match actual.get(name) {
+                                        None => summary.push_str(&format!("  - Missing column `{}` (expected {}{})\n", name, ty, len.map(|n| format!("({})", n)).unwrap_or_default())),
+                                        Some((aty, anull, alen)) => {
+                                            // type check (contains to allow varchar vs varchar)
+                                            if !aty.contains(ty) { summary.push_str(&format!("  - Type mismatch `{}` actual {} vs expected {}\n", name, aty, ty)); }
+                                            if *anull && !nullable { summary.push_str(&format!("  - Nullability mismatch `{}` is NULL but expected NOT NULL\n", name)); }
+                                            if let (Some(exp), Some(act)) = (len, *alen) { if act < exp as i64 { summary.push_str(&format!("  - Length `{}` actual {} < expected {}\n", name, act, exp)); } }
+                                        }
+                                    }
+                                }
+                                // Index check on id
+                                let idx = sqlx::query(
+                                    "SELECT INDEX_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?"
+                                ).bind(&dbname).bind(table).fetch_all(&pool1).await?;
+                                let has_id_idx = idx.iter().any(|r| { use sqlx::Row; r.get::<String,_>("COLUMN_NAME").to_lowercase()=="id" });
+                                if !has_id_idx { index_suggestions.push(format!("ALTER TABLE `{}`.`{}` ADD INDEX idx_{}_id (id);", dbname, table, table)); }
+                            }
+                            if let (true, Some(table2)) = (self.enable_dual, t2.as_ref()) {
+                                let cfg2 = DatabaseConfig { host: host2.clone(), port: port2.parse().unwrap_or(3306), username: user2.clone(), password: pass2.clone(), database: dbname2.clone() };
+                                let pool2 = make_pool_with_size(&cfg2, Some(4)).await?;
+                                summary.push_str(&format!("[DB2:{}] Table `{}`\n", dbname2, table2));
+                                let cols2 = sqlx::query(
+                                    "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION"
+                                ).bind(&dbname2).bind(table2).fetch_all(&pool2).await?;
+                                let mut actual2: std::collections::HashMap<String,(String,bool,Option<i64>)> = std::collections::HashMap::new();
+                                for row in cols2 {
+                                    use sqlx::Row;
+                                    let cname: String = row.get::<String,_>("COLUMN_NAME");
+                                    let dtype: String = row.get::<String,_>("DATA_TYPE");
+                                    let is_null: String = row.get::<String,_>("IS_NULLABLE");
+                                    let clen: Option<i64> = row.try_get::<i64,_>("CHARACTER_MAXIMUM_LENGTH").ok();
+                                    actual2.insert(cname.to_lowercase(), (dtype.to_lowercase(), is_null=="YES", clen));
+                                }
+                                for name in ["id","uuid","first_name","last_name","birthdate"] {
+                                    if !actual2.contains_key(name) { summary.push_str(&format!("  - Missing column `{}`\n", name)); }
+                                }
+                                let idx2 = sqlx::query(
+                                    "SELECT INDEX_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?"
+                                ).bind(&dbname2).bind(table2).fetch_all(&pool2).await?;
+                                let has_id_idx2 = idx2.iter().any(|r| { use sqlx::Row; r.get::<String,_>("COLUMN_NAME").to_lowercase()=="id" });
+                                if !has_id_idx2 { index_suggestions.push(format!("ALTER TABLE `{}`.`{}` ADD INDEX idx_{}_id (id);", dbname2, table2, table2)); }
+                            }
+                            anyhow::Ok(())
+                        });
+                        let _ = res; // ignore analysis errors silently in report generation
+                        out.push_str("Schema Analysis (metadata-only):\n");
+                        if summary.is_empty() { out.push_str("  OK: No obvious schema issues detected for selected tables.\n"); } else { out.push_str(&summary); }
+                        if !index_suggestions.is_empty() { out.push_str("Index Suggestions:\n"); for s in &index_suggestions { out.push_str(&format!("  {}\n", s)); } }
+                        if !grant_suggestions.is_empty() { out.push_str("Privilege Suggestions:\n"); for s in &grant_suggestions { out.push_str(&format!("  {}\n", s)); } }
+                        if !charset_notes.is_empty() { out.push_str("Charset/Collation Notes:\n"); for s in &charset_notes { out.push_str(&format!("  {}\n", s)); } }
+                    }
+                    // Env (selected)
+                    if !env_selected.is_empty() { out.push_str("Env selected (sanitized):\n"); for (k,v) in &env_selected { out.push_str(&format!("  {}={}\n", k, v)); } }
+                    // Log tail
+                    if !self.log_buffer.is_empty() { out.push_str("Log tail (most recent first):\n"); for line in self.log_buffer.iter().rev().take(200) { out.push_str(&format!("  {}\n", line)); } }
                 }
                 fs::write(&path, out)?;
                 Ok(path)
@@ -969,7 +1116,7 @@ impl GuiApp {
                 out.push_str(&format!("  \"app\": \"SRS-II Name Matching Application\",\n"));
                 out.push_str(&format!("  \"version\": \"{}\",\n", ver));
                 out.push_str(&format!("  \"timestamp\": \"{}\",\n", Utc::now().to_rfc3339()));
-                out.push_str(&format!("  \"system\": {{ \"cores\": {}, \"mem_avail_mb\": {} }},\n", cores, mem.avail_mb));
+                out.push_str(&format!("  \"system\": {{ \"os\": \"{}\", \"arch\": \"{}\", \"cores\": {}, \"mem_avail_mb\": {} }},\n", os, arch, cores, mem.avail_mb));
                 out.push_str("  \"config\": {\n");
                 out.push_str(&format!("    \"db1_host\": \"{}\",\n", escape(&self.host)));
                 out.push_str(&format!("    \"db1_database\": \"{}\",\n", escape(&self.db)));
@@ -983,6 +1130,62 @@ impl GuiApp {
                 out.push_str(&format!("    \"algo\": \"{}\",\n", algo_str));
                 out.push_str(&format!("    \"fmt\": \"{}\"\n", fmt_str));
                 out.push_str("  },\n");
+                // env_selected
+                out.push_str("  \"env_selected\": [\n");
+                for (i,(k,v)) in env_selected.iter().enumerate() { if i>0 { out.push_str(",\n"); } out.push_str(&format!("    {{ \"key\": \"{}\", \"value\": \"{}\" }}", escape(k), escape(v))); }
+                out.push_str("\n  ],\n");
+                // log_tail
+                out.push_str("  \"log_tail\": [\n");
+                for (i,line) in self.log_buffer.iter().rev().take(200).enumerate() { if i>0 { out.push_str(",\n"); } out.push_str(&format!("    \"{}\"", escape(line))); }
+                out.push_str("\n  ],\n");
+                // optional schema analysis
+                if self.schema_analysis_enabled {
+                    let t1 = self.tables.get(self.table1_idx).cloned();
+                    let t2 = if self.enable_dual { self.tables2.get(self.table2_idx).cloned() } else { None };
+                    let host = self.host.clone(); let port = self.port.clone(); let user = self.user.clone(); let pass = self.pass.clone(); let dbname = self.db.clone();
+                    let host2 = self.host2.clone(); let port2 = self.port2.clone(); let user2 = self.user2.clone(); let pass2 = self.pass2.clone(); let dbname2 = self.db2.clone();
+                    let mut summary = String::new();
+                    let mut index_suggestions: Vec<String> = Vec::new();
+                    let mut grant_suggestions: Vec<String> = Vec::new();
+                    let mut charset_notes: Vec<String> = Vec::new();
+                    if let Some(last) = self.error_events.last() {
+                        let mm = last.message.to_ascii_lowercase() + "\n" + &last.chain.clone().unwrap_or_default().to_ascii_lowercase();
+                        if mm.contains("command denied") || mm.contains("access denied") { grant_suggestions.push(format!("GRANT SELECT ON `{}`.* TO '{}'@'%';", self.db, self.user)); }
+                        if mm.contains("incorrect string value") || mm.contains("collation") { charset_notes.push("Consider aligning character set/collation: ALTER TABLE `<db>.<table>` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;".into()); }
+                        if mm.contains("foreign key constraint fails") { charset_notes.push("Verify parent rows exist and consider indexing FK columns in child table to speed checks.".into()); }
+                    }
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    let _ = rt.block_on(async {
+                        let cfg1 = DatabaseConfig { host: host.clone(), port: port.parse().unwrap_or(3306), username: user.clone(), password: pass.clone(), database: dbname.clone() };
+                        let pool1 = make_pool_with_size(&cfg1, Some(4)).await?;
+                        if let Some(table) = t1.as_ref() {
+                            summary.push_str(&format!("[DB1:{}] Table `{}`\n", dbname, table));
+                            let cols = sqlx::query("SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION").bind(&dbname).bind(table).fetch_all(&pool1).await?;
+                            let mut actual: std::collections::HashMap<String,(String,bool,Option<i64>)> = std::collections::HashMap::new();
+                            for row in cols { use sqlx::Row; let cname: String = row.get("COLUMN_NAME"); let dtype: String = row.get("DATA_TYPE"); let is_null: String = row.get("IS_NULLABLE"); let clen: Option<i64> = row.try_get("CHARACTER_MAXIMUM_LENGTH").ok(); actual.insert(cname.to_lowercase(), (dtype.to_lowercase(), is_null=="YES", clen)); }
+                            let expected = [("id","bigint", false, None),("uuid","varchar", false, Some(64)),("first_name","varchar", false, Some(255)),("middle_name","varchar", true, Some(255)),("last_name","varchar", false, Some(255)),("birthdate","date", false, None)];
+                            for (name, ty, nullable, len) in expected { match actual.get(name) { None => summary.push_str(&format!("  - Missing column `{}` (expected {}{})\n", name, ty, len.map(|n| format!("({})", n)).unwrap_or_default())), Some((aty, anull, alen)) => { if !aty.contains(ty) { summary.push_str(&format!("  - Type mismatch `{}` actual {} vs expected {}\n", name, aty, ty)); } if *anull && !nullable { summary.push_str(&format!("  - Nullability mismatch `{}` is NULL but expected NOT NULL\n", name)); } if let (Some(exp), Some(act)) = (len, *alen) { if act < exp as i64 { summary.push_str(&format!("  - Length `{}` actual {} < expected {}\n", name, act, exp)); } } } } }
+                            let idx = sqlx::query("SELECT INDEX_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?").bind(&dbname).bind(table).fetch_all(&pool1).await?; let has_id_idx = idx.iter().any(|r| { use sqlx::Row; r.get::<String,_>("COLUMN_NAME").to_lowercase()=="id" }); if !has_id_idx { index_suggestions.push(format!("ALTER TABLE `{}`.`{}` ADD INDEX idx_{}_id (id);", dbname, table, table)); }
+                        }
+                        if let (true, Some(table2)) = (self.enable_dual, t2.as_ref()) {
+                            let cfg2 = DatabaseConfig { host: host2.clone(), port: port2.parse().unwrap_or(3306), username: user2.clone(), password: pass2.clone(), database: dbname2.clone() };
+                            let pool2 = make_pool_with_size(&cfg2, Some(4)).await?;
+                            summary.push_str(&format!("[DB2:{}] Table `{}`\n", dbname2, table2));
+                            let cols2 = sqlx::query("SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION").bind(&dbname2).bind(table2).fetch_all(&pool2).await?;
+                            let mut actual2: std::collections::HashMap<String,(String,bool,Option<i64>)> = std::collections::HashMap::new();
+                            for row in cols2 { use sqlx::Row; let cname: String = row.get("COLUMN_NAME"); let dtype: String = row.get("DATA_TYPE"); let is_null: String = row.get("IS_NULLABLE"); let clen: Option<i64> = row.try_get("CHARACTER_MAXIMUM_LENGTH").ok(); actual2.insert(cname.to_lowercase(), (dtype.to_lowercase(), is_null=="YES", clen)); }
+                            for name in ["id","uuid","first_name","last_name","birthdate"] { if !actual2.contains_key(name) { summary.push_str(&format!("  - Missing column `{}`\n", name)); } }
+                            let idx2 = sqlx::query("SELECT INDEX_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?").bind(&dbname2).bind(table2).fetch_all(&pool2).await?; let has_id_idx2 = idx2.iter().any(|r| { use sqlx::Row; r.get::<String,_>("COLUMN_NAME").to_lowercase()=="id" }); if !has_id_idx2 { index_suggestions.push(format!("ALTER TABLE `{}`.`{}` ADD INDEX idx_{}_id (id);", dbname2, table2, table2)); }
+                        }
+                        anyhow::Ok(())
+                    });
+                    out.push_str("  \"schema_analysis\": {\n");
+                    out.push_str(&format!("    \"summary\": \"{}\",\n", escape(&summary)));
+                    out.push_str("    \"index_suggestions\": [\n"); for (i,s) in index_suggestions.iter().enumerate() { if i>0 { out.push_str(",\n"); } out.push_str(&format!("      \"{}\"", escape(s))); } out.push_str("\n    ],\n");
+                    out.push_str("    \"grant_suggestions\": [\n"); for (i,s) in grant_suggestions.iter().enumerate() { if i>0 { out.push_str(",\n"); } out.push_str(&format!("      \"{}\"", escape(s))); } out.push_str("\n    ],\n");
+                    out.push_str("    \"charset_notes\": [\n"); for (i,s) in charset_notes.iter().enumerate() { if i>0 { out.push_str(",\n"); } out.push_str(&format!("      \"{}\"", escape(s))); } out.push_str("\n    ]\n");
+                    out.push_str("  },\n");
+                }
                 out.push_str("  \"events\": [\n");
                 for (i, e) in self.error_events.iter().enumerate() {
                     if i>0 { out.push_str(",\n"); }
