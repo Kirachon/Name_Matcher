@@ -1286,7 +1286,7 @@ let mut gpu_done = false;
             let frac = (processed as f32 / total_outer as f32).clamp(0.0, 1.0);
             let eta = if frac > 0.0 { (start_time.elapsed().as_secs_f32() * (1.0 - frac) / frac) as u64 } else { 0 };
             let memx = memory_stats_mb();
-            on_progress(ProgressUpdate { processed, total: total_outer as usize, percent: frac * 100.0, eta_secs: eta, mem_used_mb: memx.used_mb, mem_avail_mb: memx.avail_mb, stage: if gpu_done { "gpu_kernel" } else { "streaming" }, batch_size_current: Some(batch), gpu_total_mb: 0, gpu_free_mb: 0, gpu_active: gpu_done });
+            on_progress(ProgressUpdate { processed, total: total_outer as usize, percent: frac * 100.0, eta_secs: eta, mem_used_mb: memx.used_mb, mem_avail_mb: memx.avail_mb, stage: if gpu_done { "gpu_kernel" } else { "streaming" }, batch_size_current: Some(batch), gpu_total_mb: if gpu_done { 1 } else { 0 }, gpu_free_mb: 0, gpu_active: gpu_done });
             tokio::task::yield_now().await;
         }
     }
