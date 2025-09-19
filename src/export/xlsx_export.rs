@@ -180,7 +180,7 @@ impl XlsxStreamWriter {
             write_algo2_sheet(&mut ws2, &[])?;
         }
         {
-            let mut ws3 = workbook.add_worksheet();
+            let ws3 = workbook.add_worksheet();
             ws3.set_name("Summary")?;
         }
         Ok(Self{ workbook, next_r1: 1, next_r2: 1, out_path: out_path.to_string() })

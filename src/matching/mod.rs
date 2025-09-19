@@ -100,6 +100,7 @@ fn fuzzy_compare_names_new(n1_first: &str, n1_mid: Option<&str>, n1_last: &str, 
     None
 }
 
+#[allow(dead_code)]
 fn compare_persons_new(p1: &Person, p2: &Person) -> Option<(f64, String)> {
     if p1.birthdate != p2.birthdate { return None; }
     fuzzy_compare_names_new(&p1.first_name, p1.middle_name.as_deref(), &p1.last_name,
@@ -125,23 +126,31 @@ pub struct ProgressUpdate {
     pub eta_secs: u64,
     pub mem_used_mb: u64,
     pub mem_avail_mb: u64,
+    #[allow(dead_code)]
     pub stage: &'static str,
+    #[allow(dead_code)]
     pub batch_size_current: Option<i64>,
     // GPU-related (0/false when CPU-only)
+    #[allow(dead_code)]
     pub gpu_total_mb: u64,
+    #[allow(dead_code)]
     pub gpu_free_mb: u64,
+    #[allow(dead_code)]
     pub gpu_active: bool,
 }
 
 
 // --- Optional GPU backend abstraction ---
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum ComputeBackend { Cpu, Gpu }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct GpuConfig { pub device_id: Option<usize>, pub mem_budget_mb: u64 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct MatchOptions { pub backend: ComputeBackend, pub gpu: Option<GpuConfig>, pub progress: ProgressConfig }
 
 impl Default for MatchOptions {
@@ -150,6 +159,7 @@ impl Default for MatchOptions {
     }
 }
 
+#[allow(dead_code)]
 pub fn match_all_with_opts<F>(table1: &[Person], table2: &[Person], algo: MatchingAlgorithm, opts: MatchOptions, progress: F) -> Vec<MatchPair>
 where F: Fn(ProgressUpdate) + Sync,
 {
@@ -173,6 +183,7 @@ fn matches_algo2(p1: &NormalizedPerson, p2: &NormalizedPerson) -> bool {
     p1.last_name == p2.last_name && p1.first_name == p2.first_name && middle_match && p1.birthdate == p2.birthdate
 }
 
+#[allow(dead_code)]
 pub fn match_all<F>(table1: &[Person], table2: &[Person], algo: MatchingAlgorithm, progress: F) -> Vec<MatchPair>
 where F: Fn(f32) + Sync,
 { match_all_progress(table1, table2, algo, ProgressConfig::default(), |u| progress(u.percent)) }
@@ -608,6 +619,8 @@ mod tests {
         let _ = metaphone_pct("Jos\u{00e9}", "Jose");
         let _ = metaphone_pct("M\u{00fc}ller", "Muller");
         let _ = metaphone_pct("\u{738b}\u{5c0f}\u{660e}", "Wang Xiaoming");
+    }
+
     #[test]
     fn compute_stream_cfg_bounds_and_flush() {
         let c1 = compute_stream_cfg(512);
@@ -618,7 +631,46 @@ mod tests {
         assert_eq!(c2.flush_every, (c2.batch_size as usize / 10).max(1000));
     }
 
+    #[tokio::test]
+    async fn prefetch_pipeline_sim() {
+        use tokio::task::JoinHandle;
+        let total_chunks = 5usize;
+        let batch = 10i32;
+        let mut next: Option<JoinHandle<Vec<i32>>> = None;
+        let mut out: Vec<i32> = Vec::new();
+        let mut offset = 0i32;
+        while (offset as usize) < total_chunks * batch as usize {
+            let cur: Vec<i32> = if let Some(h) = next.take() { h.await.unwrap() } else {
+                let start = offset; let b = batch;
+                tokio::spawn(async move { (start..start+b).collect::<Vec<_>>() }).await.unwrap()
+            };
+            out.extend(cur.iter());
+            offset += batch;
+            if (offset as usize) < total_chunks * batch as usize {
+                let start = offset; let b = batch;
+                next = Some(tokio::spawn(async move { (start..start+b).collect::<Vec<_>>() }));
+            }
+        }
+        assert_eq!(out.len(), total_chunks * batch as usize);
+        assert_eq!(out[0], 0);
+        assert_eq!(*out.last().unwrap(), (total_chunks as i32 * batch) - 1);
     }
+
+    #[test]
+    fn checkpoint_roundtrip() {
+        use crate::util::checkpoint::{save_checkpoint, load_checkpoint, remove_checkpoint, StreamCheckpoint};
+        let path = format!("{}\\nmckpt_test_{}.ckpt", std::env::temp_dir().display(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+        let cp = StreamCheckpoint { db: "db".into(), table_inner: "t1".into(), table_outer: "t2".into(), algorithm: "Algo".into(), batch_size: 123, next_offset: 456, total_outer: 789, partition_idx: 0, partition_name: "p".into(), updated_utc: "now".into() };
+        save_checkpoint(&path, &cp).unwrap();
+        let loaded = load_checkpoint(&path).expect("should load");
+        assert_eq!(loaded.table_inner, cp.table_inner);
+        assert_eq!(loaded.next_offset, cp.next_offset);
+        remove_checkpoint(&path);
+        assert!(load_checkpoint(&path).is_none());
+    }
+
+
+
 
 
 }
@@ -688,6 +740,7 @@ impl Default for StreamingConfig {
 
 /// Compute an adaptive StreamingConfig based on available memory (MB).
 /// Conservative defaults with clamped batch sizes for stability across machines.
+#[allow(dead_code)]
 pub fn compute_stream_cfg(avail_mb: u64) -> StreamingConfig {
     let mut cfg = StreamingConfig::default();
     // Start with a conservative estimate: roughly a quarter of free RAM in rows, with clamps
@@ -703,6 +756,7 @@ pub fn compute_stream_cfg(avail_mb: u64) -> StreamingConfig {
 #[derive(Clone)]
 pub struct StreamControl { pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>, pub pause: std::sync::Arc<std::sync::atomic::AtomicBool> }
 
+#[allow(dead_code)]
 pub async fn stream_match_csv<F>(pool: &MySqlPool, table1: &str, table2: &str, algo: MatchingAlgorithm, mut on_match: F, cfg: StreamingConfig, on_progress: impl Fn(ProgressUpdate), ctrl: Option<StreamControl>) -> Result<usize>
 where F: FnMut(&MatchPair) -> Result<()>
 {
@@ -1045,6 +1099,7 @@ use crate::models::ColumnMapping;
 
 #[derive(Clone, Debug)]
 pub struct PartitioningConfig {
+    #[allow(dead_code)]
     pub enabled: bool,
     pub strategy: String, // e.g., "last_initial" | "birthyear5"
 }
@@ -1134,7 +1189,8 @@ where F: FnMut(&MatchPair) -> Result<()>
             };
 
             // Try GPU first (per-chunk) if available; fallback to CPU if disabled/failed
-            let mut gpu_done = false;
+            #[allow(unused_mut)]
+let mut gpu_done = false;
             #[cfg(feature = "gpu")]
             {
                 let opts = MatchOptions { backend: ComputeBackend::Gpu, gpu: Some(GpuConfig { device_id: None, mem_budget_mb: 512 }), progress: ProgressConfig::default() };

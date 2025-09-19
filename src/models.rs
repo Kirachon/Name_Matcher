@@ -59,6 +59,7 @@ impl Default for ColumnMapping {
 }
 
 impl ColumnMapping {
+    #[allow(dead_code)]
     pub fn required_ok(&self) -> bool {
         !self.id.is_empty() && !self.uuid.is_empty() && !self.first_name.is_empty() && !self.last_name.is_empty() && !self.birthdate.is_empty()
     }
