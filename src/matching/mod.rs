@@ -483,7 +483,20 @@ mod gpu {
             // Build candidate pairs for this outer p1 in tiles of tile_max
             let mut start = 0;
             while start < cands_vec.len() {
-                let end = (start + tile_max).min(cands_vec.len());
+                // Dynamic tile sizing BEFORE slicing: compute tile_len based on VRAM and mem_budget
+                let remaining = cands_vec.len() - start;
+                if remaining == 0 { break; }
+                let (_tot_mb, free_mb_now) = cuda_mem_info_mb(&ctx);
+                let budget_mb = opts.gpu.map(|g| g.mem_budget_mb).unwrap_or(512);
+                let target_mb = free_mb_now.min(budget_mb).saturating_sub(64);
+                let bytes_per_pair_est: u64 = 128; // conservative estimate
+                let mut suggested_pairs = ((target_mb as u64 * 1024 * 1024) / bytes_per_pair_est) as usize;
+                if suggested_pairs == 0 { suggested_pairs = 1; }
+                let min_pairs = remaining.min(1024).max(1);
+                let max_pairs = remaining.max(1);
+                suggested_pairs = suggested_pairs.clamp(min_pairs, max_pairs);
+                let tile_len = suggested_pairs.min(tile_max).min(remaining).max(1);
+                let end = start + tile_len;
                 let cur = &cands_vec[start..end];
                 // Build flat buffers for names
                 let mut a_offsets = Vec::<i32>::with_capacity(cur.len());
@@ -510,14 +523,7 @@ mod gpu {
                 let n_pairs = cur.len();
                 if n_pairs == 0 { start = end; continue; }
 
-                // Dynamic tile sizing: target ~85% of free or mem_budget
-                let (_tot_mb, free_mb_now) = cuda_mem_info_mb(&ctx);
-                let budget_mb = opts.gpu.map(|g| g.mem_budget_mb).unwrap_or(512);
-                let target_mb = free_mb_now.min(budget_mb).saturating_sub(64); // headroom
-                let bytes_per_pair_est: u64 = 128; // conservative estimate
-                let mut suggested_pairs = ((target_mb as u64 * 1024 * 1024) / bytes_per_pair_est) as usize;
-                suggested_pairs = suggested_pairs.clamp(1024, cands_vec.len() - start);
-                let n_pairs = n_pairs.min(suggested_pairs);
+                // Tile length already chosen before slicing; n_pairs = cur.len()
 
                 // Adaptive attempt with backoff on OOM
                 let mut attempt_ok = false;
