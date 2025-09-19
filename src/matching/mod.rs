@@ -8,6 +8,8 @@ use strsim::{levenshtein, jaro_winkler};
 use rphonetic::{DoubleMetaphone, Encoder};
 use unicode_normalization::UnicodeNormalization;
 
+use chrono::Datelike;
+
 fn normalize_simple(s: &str) -> String {
     s.trim().to_lowercase().replace('.', "").replace('-', " ")
 }
@@ -283,12 +285,13 @@ where F: Fn(ProgressUpdate) + Sync,
     }
 
     #[cfg(feature = "gpu")]
-    fn cuda_mem_info_mb(dev: &cudarc::driver::CudaDevice) -> (u64,u64) {
-        // Try cuMemGetInfo_v2; if unavailable, return zeros and rely on backoff.
-        #[allow(unused_unsafe)] unsafe {
+    fn cuda_mem_info_mb(_ctx: &cudarc::driver::CudaContext) -> (u64,u64) {
+        // Query using CUDA driver API; context must be current.
+        unsafe {
+            use cudarc::driver::sys::CUresult;
             let mut free: usize = 0; let mut total: usize = 0;
             let res = cudarc::driver::sys::cuMemGetInfo_v2(&mut free as *mut _ as *mut _, &mut total as *mut _ as *mut _);
-            if res == 0 { ((total as u64)/1024/1024, (free as u64)/1024/1024) } else { (0,0) }
+            if res == CUresult::CUDA_SUCCESS { ((total as u64)/1024/1024, (free as u64)/1024/1024) } else { (0,0) }
         }
     }
 
@@ -296,7 +299,7 @@ where F: Fn(ProgressUpdate) + Sync,
 mod gpu {
     use super::*;
     use anyhow::{anyhow, Result};
-    use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
     use cudarc::nvrtc::compile_ptx;
 
     const MAX_STR: usize = 64; // truncate names for GPU DP to keep registers/local mem bounded
@@ -427,17 +430,18 @@ mod gpu {
             block.entry(BKey(year, fi, li, sx)).or_default().push(j);
         }
 
-        // 3) Prepare CUDA device
+        // 3) Prepare CUDA context & stream
         let dev_id = opts.gpu.and_then(|g| g.device_id).unwrap_or(0);
-        let dev = CudaDevice::new(dev_id).map_err(|e| anyhow!("CUDA init failed: {e}"))?;
+        let ctx = CudaContext::new(dev_id).map_err(|e| anyhow!("CUDA init failed: {e}"))?;
+        let stream = ctx.default_stream();
         let ptx = compile_ptx(LEV_KERNEL_SRC).map_err(|e| anyhow!("NVRTC compile failed: {e}"))?;
-        dev.load_ptx(ptx, "lev_mod", &[]).map_err(|e| anyhow!("Load PTX failed: {e}"))?;
-        let func = dev.get_func("lev_mod", "lev_kernel").map_err(|e| anyhow!("Get func failed: {e}"))?;
-        let func_jaro = dev.get_func("lev_mod", "jaro_kernel").map_err(|e| anyhow!("Get jaro func failed: {e}"))?;
-        let func_jw = dev.get_func("lev_mod", "jw_kernel").map_err(|e| anyhow!("Get jw func failed: {e}"))?;
+        let module = ctx.load_module(ptx).map_err(|e| anyhow!("Load PTX failed: {e}"))?;
+        let func = module.load_function("lev_kernel").map_err(|e| anyhow!("Get func failed: {e}"))?;
+        let func_jaro = module.load_function("jaro_kernel").map_err(|e| anyhow!("Get jaro func failed: {e}"))?;
+        let func_jw = module.load_function("jw_kernel").map_err(|e| anyhow!("Get jw func failed: {e}"))?;
 
         // Report GPU init and memory info
-        let (gpu_total_mb, mut gpu_free_mb) = cuda_mem_info_mb(&dev);
+        let (gpu_total_mb, mut gpu_free_mb) = cuda_mem_info_mb(&ctx);
         let mem0 = memory_stats_mb();
         on_progress(ProgressUpdate { processed: 0, total: n1.len(), percent: 0.0, eta_secs: 0, mem_used_mb: mem0.used_mb, mem_avail_mb: mem0.avail_mb, stage: "gpu_init", batch_size_current: None, gpu_total_mb, gpu_free_mb, gpu_active: true });
 
@@ -500,27 +504,43 @@ mod gpu {
                 let mut attempt_ok = false;
                 loop {
                     // refresh GPU free mem for display
-                    let (_tot, free_now) = cuda_mem_info_mb(&dev); gpu_free_mb = free_now.max(gpu_free_mb);
+                    let (_tot, free_now) = cuda_mem_info_mb(&ctx); gpu_free_mb = free_now.max(gpu_free_mb);
                     let try_run: anyhow::Result<Vec<f32>> = (|| {
                         // Device buffers
-                        let d_a = dev.htod_copy(a_bytes.as_slice())?;
-                        let d_a_off = dev.htod_copy(a_offsets.as_slice())?;
-                        let d_a_len = dev.htod_copy(a_lengths.as_slice())?;
-                        let d_b = dev.htod_copy(b_bytes.as_slice())?;
-                        let d_b_off = dev.htod_copy(b_offsets.as_slice())?;
-                        let d_b_len = dev.htod_copy(b_lengths.as_slice())?;
-                        let mut d_out = dev.alloc_zeros::<f32>(n_pairs)?;
-                        let mut d_out_j = dev.alloc_zeros::<f32>(n_pairs)?;
-                        let mut d_out_w = dev.alloc_zeros::<f32>(n_pairs)?;
+                        let d_a = stream.memcpy_stod(a_bytes.as_slice())?;
+                        let d_a_off = stream.memcpy_stod(a_offsets.as_slice())?;
+                        let d_a_len = stream.memcpy_stod(a_lengths.as_slice())?;
+                        let d_b = stream.memcpy_stod(b_bytes.as_slice())?;
+                        let d_b_off = stream.memcpy_stod(b_offsets.as_slice())?;
+                        let d_b_len = stream.memcpy_stod(b_lengths.as_slice())?;
+                        let mut d_out = stream.alloc_zeros::<f32>(n_pairs)?;
+                        let mut d_out_j = stream.alloc_zeros::<f32>(n_pairs)?;
+                        let mut d_out_w = stream.alloc_zeros::<f32>(n_pairs)?;
                         // Launch kernels
                         let cfg = LaunchConfig::for_num_elems(n_pairs as u32);
-                        unsafe { func.launch(cfg, (&d_a, &d_a_off, &d_a_len, &d_b, &d_b_off, &d_b_len, &mut d_out, n_pairs as i32)) }?;
-                        unsafe { func_jaro.launch(cfg, (&d_a, &d_a_off, &d_a_len, &d_b, &d_b_off, &d_b_len, &mut d_out_j, n_pairs as i32)) }?;
-                        unsafe { func_jw.launch(cfg, (&d_a, &d_a_off, &d_a_len, &d_b, &d_b_off, &d_b_len, &mut d_out_w, n_pairs as i32)) }?;
+                        let n_i32 = n_pairs as i32;
+                        // lev
+                        let mut b1 = stream.launch_builder(&func);
+                        b1.arg(&d_a); b1.arg(&d_a_off); b1.arg(&d_a_len);
+                        b1.arg(&d_b); b1.arg(&d_b_off); b1.arg(&d_b_len);
+                        b1.arg(&mut d_out); b1.arg(&n_i32);
+                        unsafe { b1.launch(cfg)?; }
+                        // jaro
+                        let mut b2 = stream.launch_builder(&func_jaro);
+                        b2.arg(&d_a); b2.arg(&d_a_off); b2.arg(&d_a_len);
+                        b2.arg(&d_b); b2.arg(&d_b_off); b2.arg(&d_b_len);
+                        b2.arg(&mut d_out_j); b2.arg(&n_i32);
+                        unsafe { b2.launch(cfg)?; }
+                        // jw
+                        let mut b3 = stream.launch_builder(&func_jw);
+                        b3.arg(&d_a); b3.arg(&d_a_off); b3.arg(&d_a_len);
+                        b3.arg(&d_b); b3.arg(&d_b_off); b3.arg(&d_b_len);
+                        b3.arg(&mut d_out_w); b3.arg(&n_i32);
+                        unsafe { b3.launch(cfg)?; }
                         // Read back and combine
-                        let lev_scores: Vec<f32> = dev.dtoh_sync_copy(&d_out)?;
-                        let jaro_scores: Vec<f32> = dev.dtoh_sync_copy(&d_out_j)?;
-                        let jw_scores: Vec<f32> = dev.dtoh_sync_copy(&d_out_w)?;
+                        let lev_scores: Vec<f32> = stream.memcpy_dtov(&d_out)?;
+                        let jaro_scores: Vec<f32> = stream.memcpy_dtov(&d_out_j)?;
+                        let jw_scores: Vec<f32> = stream.memcpy_dtov(&d_out_w)?;
                         let mut final_scores = lev_scores;
                         for idx in 0..final_scores.len() {
                             let mut s = final_scores[idx];
@@ -757,7 +777,7 @@ pub fn compute_stream_cfg(avail_mb: u64) -> StreamingConfig {
 pub struct StreamControl { pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>, pub pause: std::sync::Arc<std::sync::atomic::AtomicBool> }
 
 #[allow(dead_code)]
-pub async fn stream_match_csv<F>(pool: &MySqlPool, table1: &str, table2: &str, algo: MatchingAlgorithm, mut on_match: F, cfg: StreamingConfig, on_progress: impl Fn(ProgressUpdate), ctrl: Option<StreamControl>) -> Result<usize>
+pub async fn stream_match_csv<F>(pool: &MySqlPool, table1: &str, table2: &str, algo: MatchingAlgorithm, mut on_match: F, cfg: StreamingConfig, on_progress: impl Fn(ProgressUpdate) + Sync, ctrl: Option<StreamControl>) -> Result<usize>
 where F: FnMut(&MatchPair) -> Result<()>
 {
     use crate::util::checkpoint::{load_checkpoint, save_checkpoint, remove_checkpoint, StreamCheckpoint};
@@ -926,7 +946,7 @@ pub async fn stream_match_csv_dual<F>(
     algo: MatchingAlgorithm,
     mut on_match: F,
     cfg: StreamingConfig,
-    on_progress: impl Fn(ProgressUpdate),
+    on_progress: impl Fn(ProgressUpdate) + Sync,
     ctrl: Option<StreamControl>,
 ) -> Result<usize>
 where F: FnMut(&MatchPair) -> Result<()>
@@ -1112,7 +1132,7 @@ pub async fn stream_match_csv_partitioned<F>(
     algo: MatchingAlgorithm,
     mut on_match: F,
     cfg: StreamingConfig,
-    on_progress: impl Fn(ProgressUpdate),
+    on_progress: impl Fn(ProgressUpdate) + Sync,
     ctrl: Option<StreamControl>,
     mapping1: Option<&ColumnMapping>,
     mapping2: Option<&ColumnMapping>,
@@ -1194,8 +1214,7 @@ let mut gpu_done = false;
             #[cfg(feature = "gpu")]
             {
                 let opts = MatchOptions { backend: ComputeBackend::Gpu, gpu: Some(GpuConfig { device_id: None, mem_budget_mb: 512 }), progress: ProgressConfig::default() };
-                let progress_cb = |u: ProgressUpdate| { on_progress(u); };
-                match gpu::match_fuzzy_gpu(&rows, &inner_rows, opts, &progress_cb) {
+                match gpu::match_fuzzy_gpu(&rows, &inner_rows, opts, &on_progress) {
                     Ok(mut vec_pairs) => {
                         for pair in vec_pairs.drain(..) {
                             if let Some((score, label)) = compare_persons_new(&pair.person1, &pair.person2) {

@@ -90,6 +90,7 @@ pub async fn get_person_count(pool: &MySqlPool, table: &str) -> Result<i64> {
 
 
 // --- Flexible/mapped selection helpers and WHERE-aware fetchers ---
+#[allow(dead_code)]
 pub async fn get_person_rows_mapped(pool: &MySqlPool, table: &str, mapping: Option<&ColumnMapping>) -> Result<Vec<Person>> {
     super::schema::validate_ident(table)?;
     let select = build_select_list(mapping)?;
