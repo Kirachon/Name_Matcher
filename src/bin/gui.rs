@@ -11,9 +11,11 @@ use std::thread;
 
 use anyhow::Result;
 use chrono::Utc;
+use serde::Serialize;
+use std::fs;
 
 use name_matcher::config::DatabaseConfig;
-use name_matcher::db::connection::make_pool_with_size;
+use name_matcher::db::make_pool_with_size;
 use name_matcher::db::{get_person_rows, get_person_count};
 use name_matcher::matching::{stream_match_csv, stream_match_csv_dual, match_all_progress, match_all_with_opts, ProgressConfig, MatchingAlgorithm, ProgressUpdate, StreamingConfig, StreamControl, ComputeBackend, MatchOptions, GpuConfig};
 use name_matcher::export::csv_export::CsvStreamWriter;
@@ -33,6 +35,87 @@ enum Msg {
     Tables2(Vec<String>),
     Done { a1: usize, a2: usize, csv: usize, path: String },
     Error(String),
+    ErrorRich { display: String, sqlstate: Option<String>, chain: String, operation: Option<String> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ReportFormat { Text, Json }
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+enum ErrorCategory {
+    DbConnection,
+    TableValidation,
+    SchemaValidation,
+    DataFormat,
+    ResourceConstraint,
+    Configuration,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DiagEvent {
+    ts_utc: String,
+    category: ErrorCategory,
+    message: String,
+    sqlstate: Option<String>,
+    chain: Option<String>,
+    operation: Option<String>,
+    source_action: String,
+    db1_host: String,
+    db1_database: String,
+    db2_host: Option<String>,
+    db2_database: Option<String>,
+    table1: Option<String>,
+    table2: Option<String>,
+    mem_avail_mb: u64,
+    pool_size_cfg: u32,
+    env_overrides: Vec<(String,String)>,
+}
+
+fn categorize_error(msg: &str) -> ErrorCategory {
+    categorize_error_with(None, msg)
+}
+
+fn categorize_error_with(sqlstate: Option<&str>, msg: &str) -> ErrorCategory {
+    if let Some(state) = sqlstate {
+        match state {
+            "42S02" => return ErrorCategory::TableValidation, // table doesn't exist
+            "42S22" => return ErrorCategory::SchemaValidation, // column not found
+            "28000" => return ErrorCategory::DbConnection,     // access denied
+            "42000" => {
+                let m = msg.to_ascii_lowercase();
+                if m.contains("permission") || m.contains("denied") { return ErrorCategory::TableValidation; }
+                return ErrorCategory::Configuration; // syntax or config
+            }
+            "23000" => return ErrorCategory::DataFormat, // integrity constraint violation
+            _ => {}
+        }
+    }
+    let m = msg.to_ascii_lowercase();
+    if m.contains("access denied") || m.contains("authentication") || m.contains("unknown database") || m.contains("host") && m.contains("unreach") || m.contains("timed out") {
+        ErrorCategory::DbConnection
+    } else if m.contains("doesn't exist") || m.contains("no such table") || m.contains("table") && m.contains("permission") {
+        ErrorCategory::TableValidation
+    } else if m.contains("unknown column") || m.contains("column") && m.contains("type") || m.contains("index") && m.contains("missing") {
+        ErrorCategory::SchemaValidation
+    } else if m.contains("incorrect date value") || m.contains("invalid date") || m.contains("parse") && m.contains("date") || m.contains("null") && m.contains("required") || m.contains("truncation") {
+        ErrorCategory::DataFormat
+    } else if m.contains("out of memory") || m.contains("memory") && m.contains("insufficient") || m.contains("disk") && m.contains("space") {
+        ErrorCategory::ResourceConstraint
+    } else if m.contains("invalid") && m.contains("environment") || m.contains("env") && m.contains("invalid") || m.contains("malformed") || m.contains("configuration") {
+        ErrorCategory::Configuration
+    } else {
+        ErrorCategory::Unknown
+    }
+}
+
+fn extract_sqlstate_and_chain(e: &anyhow::Error) -> (Option<String>, String) {
+    let sqlstate = e.downcast_ref::<sqlx::Error>().and_then(|se| match se {
+        sqlx::Error::Database(db) => db.code().map(|c| c.to_string()),
+        _ => None,
+    });
+    let chain = format!("{:?}", e);
+    (sqlstate, chain)
 }
 
 struct GuiApp {
@@ -87,6 +170,11 @@ struct GuiApp {
     a2_count: usize,
     csv_count: usize,
     status: String,
+
+    // Diagnostics
+    error_events: Vec<DiagEvent>,
+    report_format: ReportFormat,
+    last_action: String,
 
     ctrl_cancel: Option<Arc<AtomicBool>>,
     ctrl_pause: Option<Arc<AtomicBool>>,
@@ -145,6 +233,11 @@ impl Default for GuiApp {
             a2_count: 0,
             csv_count: 0,
             status: "Idle".into(),
+            // Diagnostics
+            error_events: Vec::new(),
+            report_format: ReportFormat::Text,
+            last_action: "idle".into(),
+
             ctrl_cancel: None,
             ctrl_pause: None,
             tx: None, rx,
@@ -308,6 +401,22 @@ impl GuiApp {
                 }
             }
             if ui.button("Reset").on_hover_text("Clear the form and state").clicked() { self.reset_state(); }
+            if !self.error_events.is_empty() {
+                ui.separator();
+                ComboBox::from_label("Report Format")
+                    .selected_text(match self.report_format { ReportFormat::Text=>"TXT", ReportFormat::Json=>"JSON" })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.report_format, ReportFormat::Text, "TXT");
+                        ui.selectable_value(&mut self.report_format, ReportFormat::Json, "JSON");
+                    });
+                if ui.button("Export Error Report").on_hover_text("Export a sanitized diagnostic report for technical support").clicked() {
+                    match self.export_error_report() {
+                        Ok(p) => { self.status = format!("Error report saved to {}", p); }
+                        Err(e) => { self.status = format!("Failed to export report: {}", e); }
+                    }
+                }
+                ui.label(format!("Errors captured: {}", self.error_events.len()));
+            }
         });
 
         ui.separator();
@@ -336,6 +445,7 @@ impl GuiApp {
     fn load_tables(&mut self) {
         let (tx, rx) = mpsc::channel::<Msg>();
         self.tx = Some(tx.clone());
+        self.last_action = "Load Tables".into();
         let host = self.host.clone(); let port = self.port.clone(); let user = self.user.clone(); let pass = self.pass.clone(); let dbname = self.db.clone();
         let enable_dual = self.enable_dual;
         let host2 = self.host2.clone(); let port2 = self.port2.clone(); let user2 = self.user2.clone(); let pass2 = self.pass2.clone(); let dbname2 = self.db2.clone();
@@ -357,7 +467,7 @@ impl GuiApp {
                 });
                 match res {
                     Ok((t1, t2)) => { let _ = tx.send(Msg::Info(format!("Loaded DB1: {} tables | DB2: {} tables", t1.len(), t2.len()))); let _ = tx.send(Msg::Tables(t1)); let _ = tx.send(Msg::Tables2(t2)); },
-                    Err(e) => { let _ = tx.send(Msg::Error(format!("Failed to load tables: {}", e))); }
+                    Err(e) => { let (sqlstate, chain) = extract_sqlstate_and_chain(&e); let _ = tx.send(Msg::ErrorRich { display: format!("Failed to load tables: {}", e), sqlstate, chain, operation: Some("Load Tables (DB1+DB2)".into()) }); }
                 }
             } else {
                 let res: Result<Vec<String>> = rt.block_on(async move {
@@ -367,7 +477,7 @@ impl GuiApp {
                         .bind(dbname).fetch_all(&pool).await?;
                     Ok(rows)
                 });
-                match res { Ok(tables) => { let _ = tx.send(Msg::Info(format!("Loaded {} tables", tables.len()))); let _ = tx.send(Msg::Tables(tables)); }, Err(e) => { let _ = tx.send(Msg::Error(format!("Failed to load tables: {}", e))); } }
+                match res { Ok(tables) => { let _ = tx.send(Msg::Info(format!("Loaded {} tables", tables.len()))); let _ = tx.send(Msg::Tables(tables)); }, Err(e) => { let (sqlstate, chain) = extract_sqlstate_and_chain(&e); let _ = tx.send(Msg::ErrorRich { display: format!("Failed to load tables: {}", e), sqlstate, chain, operation: Some("Load Tables (DB1)".into()) }); } }
             }
         });
         self.rx = rx; // switch to listen on this job
@@ -377,6 +487,7 @@ impl GuiApp {
     fn start(&mut self) {
         if let Err(e) = self.validate() { self.status = format!("Error: {}", e); return; }
         self.running = true; self.progress = 0.0; self.status = "Running...".into(); self.a1_count = 0; self.a2_count = 0; self.csv_count = 0;
+        self.last_action = "Run Matching".into();
         let (tx, rx) = mpsc::channel::<Msg>();
         self.tx = Some(tx.clone()); self.rx = rx;
 
@@ -616,7 +727,7 @@ impl GuiApp {
                     }
                 }
             });
-            match res { Ok((a1,a2,csv,out_path)) => { let _ = tx.send(Msg::Done { a1, a2, csv, path: out_path }); }, Err(e) => { let _ = tx.send(Msg::Error(format!("{}", e))); } }
+            match res { Ok((a1,a2,csv,out_path)) => { let _ = tx.send(Msg::Done { a1, a2, csv, path: out_path }); }, Err(e) => { let (sqlstate, chain) = extract_sqlstate_and_chain(&e); let _ = tx.send(Msg::ErrorRich { display: format!("{}", e), sqlstate, chain, operation: Some("Run Matching".into()) }); } }
         });
     }
 
@@ -626,6 +737,7 @@ impl GuiApp {
     fn test_connection(&mut self) {
         let (tx, rx) = mpsc::channel::<Msg>();
         self.tx = Some(tx.clone());
+        self.last_action = "Test Connection".into();
         let enable_dual = self.enable_dual;
         // DB1
         let host = self.host.clone(); let port = self.port.clone(); let user = self.user.clone(); let pass = self.pass.clone(); let dbname = self.db.clone();
@@ -658,7 +770,7 @@ impl GuiApp {
             });
             match res {
                 Ok((c1,c2)) => { let _=tx.send(Msg::Info(format!("Connected. Row counts: t1={:?}, t2={:?}", c1, c2))); },
-                Err(e) => { let _=tx.send(Msg::Error(format!("Connection failed: {}", e))); }
+                Err(e) => { let (sqlstate, chain) = extract_sqlstate_and_chain(&e); let _=tx.send(Msg::ErrorRich { display: format!("Connection failed: {}", e), sqlstate, chain, operation: Some("Connect/Test".into()) }); }
             }
         });
         self.rx = rx; self.status = "Testing connection...".into();
@@ -667,6 +779,7 @@ impl GuiApp {
     fn estimate(&mut self) {
         let (tx, rx) = mpsc::channel::<Msg>();
         self.tx = Some(tx.clone());
+        self.last_action = "Estimate".into();
         let host = self.host.clone(); let port = self.port.clone(); let user = self.user.clone(); let pass = self.pass.clone(); let dbname = self.db.clone();
         let t1 = self.tables.get(self.table1_idx).cloned();
         let t2 = self.tables.get(self.table2_idx).cloned();
@@ -687,7 +800,7 @@ impl GuiApp {
                 let suggestion = if index_mb > mem_thr_mb || small > 200_000 { "Streaming" } else { "In-memory" };
                 Ok(format!("Estimated index ~{} MB ({} vs {}). Suggested mode: {} (threshold {} MB)", index_mb, c1, c2, suggestion, mem_thr_mb))
             });
-            match res { Ok(s) => { let _=tx.send(Msg::Info(s)); }, Err(e) => { let _=tx.send(Msg::Error(format!("Estimate failed: {}", e))); } }
+            match res { Ok(s) => { let _=tx.send(Msg::Info(s)); }, Err(e) => { let (sqlstate, chain) = extract_sqlstate_and_chain(&e); let _=tx.send(Msg::ErrorRich { display: format!("Estimate failed: {}", e), sqlstate, chain, operation: Some("Estimate Resources".into()) }); } }
         });
         self.rx = rx; self.status = "Estimating...".into();
     }
@@ -715,11 +828,238 @@ impl GuiApp {
                 Msg::Tables(v) => { self.tables = v; self.table1_idx = 0; if self.table1_idx >= self.tables.len() { self.table1_idx = 0; } self.status = format!("Loaded {} tables (DB1)", self.tables.len()); }
                 Msg::Tables2(v2) => { self.tables2 = v2; self.table2_idx = 0; if self.table2_idx >= self.tables2.len() { self.table2_idx = 0; } self.status = format!("Loaded {} tables (DB2)", self.tables2.len()); }
                 Msg::Done { a1, a2, csv, path } => { self.running = false; self.a1_count = a1; self.a2_count = a2; self.csv_count = csv; self.status = format!("Done. Output: {}", path); self.progress = 100.0; }
-                Msg::Error(e) => { self.running = false; self.status = format!("Error: {}", e); }
+                Msg::Error(e) => {
+                    self.running = false;
+                    self.status = format!("Error: {}", e);
+                    self.record_error(e);
+                }
+                Msg::ErrorRich { display, sqlstate, chain, operation } => {
+                    self.running = false;
+                    self.status = format!("Error: {}", display);
+                    self.record_error_with_details(display, sqlstate, Some(chain), operation);
+                }
             }
         }
     }
+
+    fn record_error(&mut self, message: String) {
+        let sanitize = |s: &str| -> String {
+            if let Some(pos) = s.find("mysql://") {
+                if let Some(at) = s[pos..].find('@') { let mut out = s.to_string(); out.replace_range(pos..pos+at, "mysql://[REDACTED]"); return out; }
+            }
+            s.to_string()
+        };
+        let mstats = name_matcher::metrics::memory_stats_mb();
+        let pool_sz = self.pool_size.parse::<u32>().unwrap_or(0);
+        let envs = ["NAME_MATCHER_POOL_SIZE","NAME_MATCHER_POOL_MIN","NAME_MATCHER_STREAMING","NAME_MATCHER_PARTITION"];
+        let mut env_overrides = Vec::new();
+        for k in envs { if let Ok(v) = std::env::var(k) { env_overrides.push((k.to_string(), v)); } }
+        let evt = DiagEvent {
+            ts_utc: Utc::now().to_rfc3339(),
+            category: categorize_error(&message),
+            message: sanitize(&message),
+            sqlstate: None,
+            chain: None,
+            operation: None,
+            source_action: self.last_action.clone(),
+            db1_host: self.host.clone(),
+            db1_database: self.db.clone(),
+            db2_host: if self.enable_dual { Some(self.host2.clone()) } else { None },
+            db2_database: if self.enable_dual { Some(self.db2.clone()) } else { None },
+            table1: self.tables.get(self.table1_idx).cloned(),
+            table2: if self.enable_dual { self.tables2.get(self.table2_idx).cloned() } else { self.tables.get(self.table2_idx).cloned() },
+            mem_avail_mb: mstats.avail_mb,
+            pool_size_cfg: pool_sz,
+            env_overrides,
+        };
+        self.error_events.push(evt);
+    }
+
+    fn export_error_report(&mut self) -> Result<String> {
+        let ts = Utc::now().format("%Y%m%d_%H%M%S").to_string();
+        let default_name = match self.report_format { ReportFormat::Text => format!("error_report_{}.txt", ts), ReportFormat::Json => format!("error_report_{}.json", ts) };
+        let mut dialog = rfd::FileDialog::new().set_file_name(&default_name);
+        match self.report_format { ReportFormat::Text => { dialog = dialog.add_filter("Text", &["txt"]); }, ReportFormat::Json => { dialog = dialog.add_filter("JSON", &["json"]); } }
+        let path = dialog.save_file().map(|p| p.display().to_string()).unwrap_or(default_name);
+
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+        let mem = name_matcher::metrics::memory_stats_mb();
+        let ver = env!("CARGO_PKG_VERSION");
+
+        let suggestions_for = |cat: ErrorCategory| -> Vec<&'static str> {
+            match cat {
+                ErrorCategory::DbConnection => vec![
+                    "Verify host/port reachability (ping, firewall)",
+                    "Check username/password and privileges",
+                    "Confirm database name exists and user has access",
+                ],
+                ErrorCategory::TableValidation => vec![
+                    "Ensure selected tables exist and user has SELECT permission",
+                    "Click 'Load Tables' to refresh the list",
+                ],
+                ErrorCategory::SchemaValidation => vec![
+                    "Add required columns and indexes (see README: Required Indexes)",
+                    "Verify column types match expected formats",
+                ],
+                ErrorCategory::DataFormat => vec![
+                    "Normalize/cleanse date formats (YYYY-MM-DD)",
+                    "Fill required fields or exclude nulls where needed",
+                ],
+                ErrorCategory::ResourceConstraint => vec![
+                    "Use Streaming mode and reduce batch size",
+                    "Close other apps to free RAM; ensure sufficient disk space",
+
+                ],
+                ErrorCategory::Configuration => vec![
+                    "Check environment variables (NAME_MATCHER_*)",
+                    "Re-enter GUI settings and retry",
+                ],
+                ErrorCategory::Unknown => vec!["Review logs and contact support with this report"],
+            }
+        };
+
+        match self.report_format {
+            ReportFormat::Text => {
+                let mut out = String::new();
+                out.push_str(&format!("SRS-II Name Matching - Diagnostic Report\nVersion: {}\nTimestamp: {}\n\n", ver, Utc::now().to_rfc3339()));
+                out.push_str(&format!("System: cores={} | mem_avail={} MB\n", cores, mem.avail_mb));
+                let mode_str = match self.mode { ModeSel::Auto => "Auto", ModeSel::Streaming => "Streaming", ModeSel::InMemory => "InMemory" };
+                let fmt_str = match self.fmt { FormatSel::Csv => "CSV", FormatSel::Xlsx => "XLSX", FormatSel::Both => "Both" };
+                let algo_str = match self.algo { MatchingAlgorithm::IdUuidYasIsMatchedInfnbd => "Algo1", MatchingAlgorithm::IdUuidYasIsMatchedInfnmnbd => "Algo2", MatchingAlgorithm::Fuzzy => "Fuzzy" };
+                out.push_str(&format!("Config: db1_host={} db1_db={} enable_dual={} pool_size={} ssd_storage={} mode={} algo={} fmt={}\n\n",
+                    self.host, self.db, self.enable_dual, self.pool_size, self.ssd_storage, mode_str, algo_str, fmt_str));
+                for (i, evt) in self.error_events.iter().enumerate() {
+                    out.push_str(&format!("[{}] {} | Category: {:?}\nAction: {}\nDB1: {}.{}\nDB2: {}.{}\nTables: {:?} vs {:?}\nMem avail: {} MB | Pool: {}\nMessage: {}\n",
+                        i+1, evt.ts_utc, evt.category, evt.source_action,
+                        evt.db1_host, evt.db1_database,
+                        evt.db2_host.clone().unwrap_or("-".into()), evt.db2_database.clone().unwrap_or("-".into()),
+                        evt.table1, evt.table2, evt.mem_avail_mb, evt.pool_size_cfg, evt.message));
+                    if let Some(ref ss) = evt.sqlstate { out.push_str(&format!("SQLSTATE: {}\n", ss)); }
+                    if let Some(ref op) = evt.operation { out.push_str(&format!("Operation: {}\n", op)); }
+                    if let Some(ref ch) = evt.chain { out.push_str("Chain:\n"); out.push_str(ch); out.push_str("\n"); }
+                    if !evt.env_overrides.is_empty() { out.push_str("Env overrides:\n"); for (k,v) in &evt.env_overrides { out.push_str(&format!("  {}={}\n", k, v)); } }
+                    // Specific remediation hints from message
+                    let mut specific: Vec<String> = Vec::new();
+                    if evt.message.contains("Unknown column '") {
+                        if let Some(s) = evt.message.find("Unknown column '") {
+                            let rest = &evt.message[s + "Unknown column '".len()..]; if let Some(e) = rest.find('\'') {
+                                let col = &rest[..e]; let tbl = evt.table1.clone().or(evt.table2.clone()).unwrap_or("<table>".into());
+                                specific.push(format!("ALTER TABLE {} ADD COLUMN {} <TYPE>" , tbl, col));
+                            }
+                        }
+                    }
+                    if evt.message.to_ascii_lowercase().contains("doesn't exist") && evt.message.to_ascii_lowercase().contains("table") {
+                        let tbl = evt.table1.clone().or(evt.table2.clone()).unwrap_or("<table>".into());
+                        specific.push(format!("CREATE TABLE {} (...) or select an existing table", tbl));
+                    }
+                    if evt.message.contains("Incorrect date value") || evt.message.contains("invalid date") {
+                        specific.push("Normalize date format to YYYY-MM-DD and ensure column type is DATE".into());
+                    }
+                    if !specific.is_empty() { out.push_str("Specific remediation:\n"); for s in &specific { out.push_str(&format!("  - {}\n", s)); } }
+                    out.push_str("Remediation:\n"); for s in suggestions_for(evt.category) { out.push_str(&format!("  - {}\n", s)); }
+                    out.push_str("\n");
+                }
+                fs::write(&path, out)?;
+                Ok(path)
+            }
+            ReportFormat::Json => {
+                let escape = |s: &str| s.replace('"', "\\\"");
+                let mut out = String::new();
+                out.push_str("{\n");
+                out.push_str(&format!("  \"app\": \"SRS-II Name Matching Application\",\n"));
+                out.push_str(&format!("  \"version\": \"{}\",\n", ver));
+                out.push_str(&format!("  \"timestamp\": \"{}\",\n", Utc::now().to_rfc3339()));
+                out.push_str(&format!("  \"system\": {{ \"cores\": {}, \"mem_avail_mb\": {} }},\n", cores, mem.avail_mb));
+                out.push_str("  \"config\": {\n");
+                out.push_str(&format!("    \"db1_host\": \"{}\",\n", escape(&self.host)));
+                out.push_str(&format!("    \"db1_database\": \"{}\",\n", escape(&self.db)));
+                out.push_str(&format!("    \"enable_dual\": {},\n", if self.enable_dual {"true"} else {"false"}));
+                out.push_str(&format!("    \"pool_size_cfg\": \"{}\",\n", escape(&self.pool_size)));
+                out.push_str(&format!("    \"ssd_storage\": {},\n", if self.ssd_storage {"true"} else {"false"}));
+                let mode_str = match self.mode { ModeSel::Auto => "Auto", ModeSel::Streaming => "Streaming", ModeSel::InMemory => "InMemory" };
+                let fmt_str = match self.fmt { FormatSel::Csv => "CSV", FormatSel::Xlsx => "XLSX", FormatSel::Both => "Both" };
+                let algo_str = match self.algo { MatchingAlgorithm::IdUuidYasIsMatchedInfnbd => "Algo1", MatchingAlgorithm::IdUuidYasIsMatchedInfnmnbd => "Algo2", MatchingAlgorithm::Fuzzy => "Fuzzy" };
+                out.push_str(&format!("    \"mode\": \"{}\",\n", mode_str));
+                out.push_str(&format!("    \"algo\": \"{}\",\n", algo_str));
+                out.push_str(&format!("    \"fmt\": \"{}\"\n", fmt_str));
+                out.push_str("  },\n");
+                out.push_str("  \"events\": [\n");
+                for (i, e) in self.error_events.iter().enumerate() {
+                    if i>0 { out.push_str(",\n"); }
+                    out.push_str("    {\n");
+                    out.push_str(&format!("      \"ts_utc\": \"{}\",\n", escape(&e.ts_utc)));
+                    out.push_str(&format!("      \"category\": \"{:?}\",\n", e.category));
+                    out.push_str(&format!("      \"message\": \"{}\",\n", escape(&e.message)));
+                    out.push_str(&format!("      \"sqlstate\": \"{}\",\n", escape(&e.sqlstate.clone().unwrap_or_default())));
+                    out.push_str(&format!("      \"operation\": \"{}\",\n", escape(&e.operation.clone().unwrap_or_default())));
+                    out.push_str(&format!("      \"chain\": \"{}\",\n", escape(&e.chain.clone().unwrap_or_default())));
+                    out.push_str(&format!("      \"source_action\": \"{}\",\n", escape(&e.source_action)));
+                    out.push_str(&format!("      \"db1_host\": \"{}\",\n", escape(&e.db1_host)));
+                    out.push_str(&format!("      \"db1_database\": \"{}\",\n", escape(&e.db1_database)));
+                    out.push_str(&format!("      \"db2_host\": \"{}\",\n", escape(&e.db2_host.clone().unwrap_or_default())));
+                    out.push_str(&format!("      \"db2_database\": \"{}\",\n", escape(&e.db2_database.clone().unwrap_or_default())));
+                    out.push_str(&format!("      \"table1\": \"{}\",\n", escape(&e.table1.clone().unwrap_or_default())));
+                    out.push_str(&format!("      \"table2\": \"{}\",\n", escape(&e.table2.clone().unwrap_or_default())));
+                    out.push_str(&format!("      \"mem_avail_mb\": {},\n", e.mem_avail_mb));
+                    out.push_str(&format!("      \"pool_size_cfg\": {}\n", e.pool_size_cfg));
+                    out.push_str("    }");
+                }
+                out.push_str("\n  ],\n");
+                out.push_str("  \"suggestions_by_event\": [\n");
+                for (i, e) in self.error_events.iter().enumerate() {
+                    if i>0 { out.push_str(",\n"); }
+                    out.push_str("    [\n");
+                    let sugg = suggestions_for(e.category);
+                    for (j, s) in sugg.iter().enumerate() {
+                        if j>0 { out.push_str(",\n"); }
+                        out.push_str(&format!("      \"{}\"", escape(s)));
+                    }
+                    out.push_str("\n    ]");
+                }
+                out.push_str("\n  ]\n");
+                out.push_str("}\n");
+                fs::write(&path, out)?;
+                Ok(path)
+            }
+        }
+    }
+
+    fn record_error_with_details(&mut self, message: String, sqlstate: Option<String>, chain: Option<String>, operation: Option<String>) {
+        let sanitize = |s: &str| -> String {
+            if let Some(pos) = s.find("mysql://") {
+                if let Some(at) = s[pos..].find('@') { let mut out = s.to_string(); out.replace_range(pos..pos+at, "mysql://[REDACTED]"); return out; }
+            }
+            s.to_string()
+        };
+        let mstats = name_matcher::metrics::memory_stats_mb();
+        let pool_sz = self.pool_size.parse::<u32>().unwrap_or(0);
+        let envs = ["NAME_MATCHER_POOL_SIZE","NAME_MATCHER_POOL_MIN","NAME_MATCHER_STREAMING","NAME_MATCHER_PARTITION"];
+        let mut env_overrides = Vec::new();
+        for k in envs { if let Ok(v) = std::env::var(k) { env_overrides.push((k.to_string(), v)); } }
+        let cat = categorize_error_with(sqlstate.as_deref(), &message);
+        let evt = DiagEvent {
+            ts_utc: Utc::now().to_rfc3339(),
+            category: cat,
+            message: sanitize(&message),
+            sqlstate,
+            chain,
+            operation,
+            source_action: self.last_action.clone(),
+            db1_host: self.host.clone(),
+            db1_database: self.db.clone(),
+            db2_host: if self.enable_dual { Some(self.host2.clone()) } else { None },
+            db2_database: if self.enable_dual { Some(self.db2.clone()) } else { None },
+            table1: self.tables.get(self.table1_idx).cloned(),
+            table2: if self.enable_dual { self.tables2.get(self.table2_idx).cloned() } else { self.tables.get(self.table2_idx).cloned() },
+            mem_avail_mb: mstats.avail_mb,
+            pool_size_cfg: pool_sz,
+            env_overrides,
+        };
+        self.error_events.push(evt);
+    }
+
 }
+
 
 impl App for GuiApp {
     fn update(&mut self, ctx: &Context, _frame: &mut Frame) {
