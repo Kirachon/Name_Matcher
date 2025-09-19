@@ -358,9 +358,6 @@ mod gpu {
         }
         if (matches == 0) return 0.0f;
         int k = 0; int trans = 0;
-        let func_jaro = dev.get_func("lev_mod", "jaro_kernel").map_err(|e| anyhow!("Get jaro func failed: {e}"))?;
-        let func_jw = dev.get_func("lev_mod", "jw_kernel").map_err(|e| anyhow!("Get jw func failed: {e}"))?;
-
         for (int i=0;i<la; ++i) {
             if (!a_match[i]) continue;
             while (k < lb && !b_match[k]) ++k;
@@ -407,6 +404,16 @@ mod gpu {
         float jw = j + l * p * (1.0f - j);
         out[i] = jw * 100.0f;
     }
+
+    extern "C" __global__ void max3_kernel(const float* a, const float* b, const float* c, float* out, int n) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i < n) {
+            float m = a[i];
+            if (b[i] > m) m = b[i];
+            if (c[i] > m) m = c[i];
+            out[i] = m;
+        }
+    }
     "#;
 
     pub fn match_fuzzy_gpu<F>(t1: &[Person], t2: &[Person], opts: MatchOptions, on_progress: &F) -> Result<Vec<MatchPair>>
@@ -430,15 +437,18 @@ mod gpu {
             block.entry(BKey(year, fi, li, sx)).or_default().push(j);
         }
 
-        // 3) Prepare CUDA context & stream
+        // 3) Prepare CUDA context & streams
         let dev_id = opts.gpu.and_then(|g| g.device_id).unwrap_or(0);
         let ctx = CudaContext::new(dev_id).map_err(|e| anyhow!("CUDA init failed: {e}"))?;
         let stream = ctx.default_stream();
+        // Second stream for overlapping next-tile transfers/compute
+        let stream2 = ctx.new_stream().map_err(|e| anyhow!("CUDA stream create failed: {e}"))?;
         let ptx = compile_ptx(LEV_KERNEL_SRC).map_err(|e| anyhow!("NVRTC compile failed: {e}"))?;
         let module = ctx.load_module(ptx).map_err(|e| anyhow!("Load PTX failed: {e}"))?;
         let func = module.load_function("lev_kernel").map_err(|e| anyhow!("Get func failed: {e}"))?;
         let func_jaro = module.load_function("jaro_kernel").map_err(|e| anyhow!("Get jaro func failed: {e}"))?;
         let func_jw = module.load_function("jw_kernel").map_err(|e| anyhow!("Get jw func failed: {e}"))?;
+        let func_max3 = module.load_function("max3_kernel").map_err(|e| anyhow!("Get max3 func failed: {e}"))?;
 
         // Report GPU init and memory info
         let (gpu_total_mb, mut gpu_free_mb) = cuda_mem_info_mb(&ctx);
@@ -500,54 +510,62 @@ mod gpu {
                 let n_pairs = cur.len();
                 if n_pairs == 0 { start = end; continue; }
 
+                // Dynamic tile sizing: target ~85% of free or mem_budget
+                let (_tot_mb, free_mb_now) = cuda_mem_info_mb(&ctx);
+                let budget_mb = opts.gpu.map(|g| g.mem_budget_mb).unwrap_or(512);
+                let target_mb = free_mb_now.min(budget_mb).saturating_sub(64); // headroom
+                let bytes_per_pair_est: u64 = 128; // conservative estimate
+                let mut suggested_pairs = ((target_mb as u64 * 1024 * 1024) / bytes_per_pair_est) as usize;
+                suggested_pairs = suggested_pairs.clamp(1024, cands_vec.len() - start);
+                let n_pairs = n_pairs.min(suggested_pairs);
+
                 // Adaptive attempt with backoff on OOM
                 let mut attempt_ok = false;
                 loop {
                     // refresh GPU free mem for display
                     let (_tot, free_now) = cuda_mem_info_mb(&ctx); gpu_free_mb = free_now.max(gpu_free_mb);
                     let try_run: anyhow::Result<Vec<f32>> = (|| {
+                        // Pick stream alternating to enable overlap
+                        let use_stream2 = (start / n_pairs) % 2 == 1;
+                        let s = if use_stream2 { &stream2 } else { &stream };
                         // Device buffers
-                        let d_a = stream.memcpy_stod(a_bytes.as_slice())?;
-                        let d_a_off = stream.memcpy_stod(a_offsets.as_slice())?;
-                        let d_a_len = stream.memcpy_stod(a_lengths.as_slice())?;
-                        let d_b = stream.memcpy_stod(b_bytes.as_slice())?;
-                        let d_b_off = stream.memcpy_stod(b_offsets.as_slice())?;
-                        let d_b_len = stream.memcpy_stod(b_lengths.as_slice())?;
-                        let mut d_out = stream.alloc_zeros::<f32>(n_pairs)?;
-                        let mut d_out_j = stream.alloc_zeros::<f32>(n_pairs)?;
-                        let mut d_out_w = stream.alloc_zeros::<f32>(n_pairs)?;
-                        // Launch kernels
+                        let d_a = s.memcpy_stod(a_bytes.as_slice())?;
+                        let d_a_off = s.memcpy_stod(a_offsets.as_slice())?;
+                        let d_a_len = s.memcpy_stod(a_lengths.as_slice())?;
+                        let d_b = s.memcpy_stod(b_bytes.as_slice())?;
+                        let d_b_off = s.memcpy_stod(b_offsets.as_slice())?;
+                        let d_b_len = s.memcpy_stod(b_lengths.as_slice())?;
+                        let mut d_lev = s.alloc_zeros::<f32>(n_pairs)?;
+                        let mut d_j = s.alloc_zeros::<f32>(n_pairs)?;
+                        let mut d_w = s.alloc_zeros::<f32>(n_pairs)?;
+                        let mut d_final = s.alloc_zeros::<f32>(n_pairs)?;
+                        // Launch kernels (on chosen stream)
                         let cfg = LaunchConfig::for_num_elems(n_pairs as u32);
                         let n_i32 = n_pairs as i32;
                         // lev
-                        let mut b1 = stream.launch_builder(&func);
-                        b1.arg(&d_a); b1.arg(&d_a_off); b1.arg(&d_a_len);
-                        b1.arg(&d_b); b1.arg(&d_b_off); b1.arg(&d_b_len);
-                        b1.arg(&mut d_out); b1.arg(&n_i32);
+                        let mut b1 = s.launch_builder(&func);
+                        b1.arg(&d_a).arg(&d_a_off).arg(&d_a_len)
+                          .arg(&d_b).arg(&d_b_off).arg(&d_b_len)
+                          .arg(&mut d_lev).arg(&n_i32);
                         unsafe { b1.launch(cfg)?; }
                         // jaro
-                        let mut b2 = stream.launch_builder(&func_jaro);
-                        b2.arg(&d_a); b2.arg(&d_a_off); b2.arg(&d_a_len);
-                        b2.arg(&d_b); b2.arg(&d_b_off); b2.arg(&d_b_len);
-                        b2.arg(&mut d_out_j); b2.arg(&n_i32);
+                        let mut b2 = s.launch_builder(&func_jaro);
+                        b2.arg(&d_a).arg(&d_a_off).arg(&d_a_len)
+                          .arg(&d_b).arg(&d_b_off).arg(&d_b_len)
+                          .arg(&mut d_j).arg(&n_i32);
                         unsafe { b2.launch(cfg)?; }
                         // jw
-                        let mut b3 = stream.launch_builder(&func_jw);
-                        b3.arg(&d_a); b3.arg(&d_a_off); b3.arg(&d_a_len);
-                        b3.arg(&d_b); b3.arg(&d_b_off); b3.arg(&d_b_len);
-                        b3.arg(&mut d_out_w); b3.arg(&n_i32);
+                        let mut b3 = s.launch_builder(&func_jw);
+                        b3.arg(&d_a).arg(&d_a_off).arg(&d_a_len)
+                          .arg(&d_b).arg(&d_b_off).arg(&d_b_len)
+                          .arg(&mut d_w).arg(&n_i32);
                         unsafe { b3.launch(cfg)?; }
-                        // Read back and combine
-                        let lev_scores: Vec<f32> = stream.memcpy_dtov(&d_out)?;
-                        let jaro_scores: Vec<f32> = stream.memcpy_dtov(&d_out_j)?;
-                        let jw_scores: Vec<f32> = stream.memcpy_dtov(&d_out_w)?;
-                        let mut final_scores = lev_scores;
-                        for idx in 0..final_scores.len() {
-                            let mut s = final_scores[idx];
-                            if jaro_scores[idx] > s { s = jaro_scores[idx]; }
-                            if jw_scores[idx] > s { s = jw_scores[idx]; }
-                            final_scores[idx] = s;
-                        }
+                        // max3
+                        let mut b4 = s.launch_builder(&func_max3);
+                        b4.arg(&d_lev).arg(&d_j).arg(&d_w).arg(&mut d_final).arg(&n_i32);
+                        unsafe { b4.launch(cfg)?; }
+                        // Read back only final
+                        let final_scores: Vec<f32> = s.memcpy_dtov(&d_final)?;
                         Ok(final_scores)
                     })();
 
