@@ -174,10 +174,11 @@ The GUI now provides an Auto Optimize button (Advanced section) that:
 - Suggests connection pool size from CPU cores (defaults to min(32, 2 x cores))
 - Picks Streaming mode for Algorithms 1/2, and In‑Memory for Fuzzy
 - Adjusts GPU memory budget suggestion (if enabled)
+- SSD storage toggle tunes flush frequency for faster buffered writes
 
 Notes:
 - Streaming mode is recommended for large tables and low‑memory systems
-- Fuzzy (Algorithm 3) is In‑Memory only; use CSV output for full detail
+- Fuzzy (Algorithm 3): GUI runs in In‑Memory mode for stability. CLI may stream fuzzy when heuristics or NAME_MATCHER_STREAMING=1 select streaming. CSV format only for fuzzy.
 
 ### Required Database Indexes
 For best performance, ensure the following indexes exist on both tables:
@@ -196,9 +197,14 @@ ALTER TABLE people ADD INDEX idx_last_name(last_name),
 - Default pool size (when not overridden) is derived from CPU cores: `min(32, 2 x cores)`
 - Override via env: `NAME_MATCHER_POOL_SIZE`, `NAME_MATCHER_POOL_MIN`
 
+- Defaults: minimum connections = 4; max defaults to min(32, 2 x cores) if not set
+- Additional tuning env: NAME_MATCHER_ACQUIRE_MS, NAME_MATCHER_IDLE_MS, NAME_MATCHER_LIFETIME_MS
+
 ### Streaming Configuration
 - Adaptive batch size is computed from available memory and clamped to [5,000; 100,000]
 - Export writers flush every ≈ 10% of the batch (min 1,000)
+- Pipelined prefetch keeps one next chunk ahead to reduce stalls while maintaining a low memory footprint
+
 - Checkpoint files (`.nmckpt`) are written next to output files to enable resume
 
 ---

@@ -2,6 +2,7 @@ use sysinfo::{System, RefreshKind, MemoryRefreshKind};
 
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryStats {
+    #[allow(dead_code)]
     pub total_mb: u64,
     pub used_mb: u64,
     pub avail_mb: u64,
