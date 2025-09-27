@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Name_Matcher – Business Process & Requirements (Executive Presentation)</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap" rel="stylesheet">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.6.1/mermaid.min.js"></script>
+  <style>
+    :root{
+      --bg:#f8fafc;
+      --surface:#ffffff;
+      --card:#ffffff;
+      --text:#1e293b;
+      --muted:#64748b;
+      --brand:#3b82f6;
+      --brand-2:#8b5cf6;
+      --brand-3:#10b981;
+      --brand-4:#f59e0b;
+      --ok:#10b981;
+      --warn:#f59e0b;
+      --bad:#ef4444;
+      --shadow:0 4px 20px rgba(0,0,0,.08);
+      --shadow-lg:0 10px 40px rgba(0,0,0,.12);
+      --radius:16px;
+      --gradient-1:linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      --gradient-2:linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+      --gradient-3:linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+      --gradient-4:linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);
+    }
+    *{box-sizing:border-box}
+    html,body{
+      margin:0;
+      padding:0;
+      background:linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color:var(--text);
+      font-family:'Inter',system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,'Helvetica Neue',Arial,'Noto Sans',sans-serif;
+      line-height:1.6;
+    }
+    .container{max-width:1200px;margin:0 auto;padding:32px}
+    a{color:var(--brand);text-decoration:none;transition:color 0.2s}
+    a:hover{color:var(--brand-2)}
+    
+    header.hero{
+      position:relative;
+      overflow:hidden;
+      border-radius:24px;
+      padding:64px 40px;
+      background:var(--gradient-1);
+      box-shadow:var(--shadow-lg);
+      color:white;
+      text-align:center;
+    }
+    header .title{
+      font-size:48px;
+      font-weight:800;
+      letter-spacing:-.5px;
+      margin:0 0 16px 0;
+      text-shadow:0 2px 4px rgba(0,0,0,.1);
+    }
+    header .subtitle{
+      color:rgba(255,255,255,.9);
+      font-size:20px;
+      margin:0 0 32px 0;
+      font-weight:400;
+    }
+    .meta{
+      display:flex;
+      gap:16px;
+      flex-wrap:wrap;
+      justify-content:center;
+    }
+    .meta .pill{
+      background:rgba(255,255,255,.2);
+      border:1px solid rgba(255,255,255,.3);
+      padding:10px 16px;
+      border-radius:999px;
+      font-size:14px;
+      color:white;
+      font-weight:500;
+      backdrop-filter:blur(10px);
+      transition:all 0.2s;
+    }
+    .meta .pill:hover{
+      background:rgba(255,255,255,.3);
+      transform:translateY(-2px);
+    }
+    
+    section{margin-top:40px}
+    .section-card{
+      background:var(--surface);
+      border:1px solid rgba(0,0,0,.06);
+      border-radius:var(--radius);
+      box-shadow:var(--shadow);
+      padding:32px;
+      transition:all 0.3s;
+    }
+    .section-card:hover{
+      box-shadow:var(--shadow-lg);
+      transform:translateY(-2px);
+    }
+    
+    h2.section-title{
+      font-size:28px;
+      font-weight:800;
+      margin:0 0 16px 0;
+      letter-spacing:-.3px;
+      background:var(--gradient-1);
+      -webkit-background-clip:text;
+      -webkit-text-fill-color:transparent;
+      background-clip:text;
+    }
+    .lead{
+      color:var(--muted);
+      margin:8px 0 24px 0;
+      font-size:16px;
+    }
+    
+    .grid{display:grid;gap:20px}
+    .grid.cols-3{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+    .grid.cols-2{grid-template-columns:repeat(auto-fit,minmax(350px,1fr))}
+    
+    .card{
+      background:var(--card);
+      border:1px solid rgba(0,0,0,.06);
+      border-radius:16px;
+      padding:24px;
+      transition:all 0.3s;
+      position:relative;
+      overflow:hidden;
+    }
+    .card::before{
+      content:'';
+      position:absolute;
+      top:0;
+      left:0;
+      right:0;
+      height:4px;
+      background:var(--gradient-1);
+    }
+    .card:nth-child(2)::before{background:var(--gradient-2)}
+    .card:nth-child(3)::before{background:var(--gradient-3)}
+    .card:nth-child(4)::before{background:var(--gradient-4)}
+    .card:nth-child(5)::before{background:var(--gradient-1)}
+    .card:nth-child(6)::before{background:var(--gradient-2)}
+    
+    .card:hover{
+      box-shadow:var(--shadow-lg);
+      transform:translateY(-4px);
+    }
+    .card h3{
+      margin:0 0 8px 0;
+      font-size:18px;
+      font-weight:700;
+      color:var(--text);
+    }
+    .card p{
+      margin:4px 0;
+      color:var(--muted);
+      line-height:1.5;
+    }
+    
+    .badge{
+      display:inline-block;
+      font-size:12px;
+      padding:6px 12px;
+      border-radius:999px;
+      background:var(--gradient-1);
+      color:white;
+      font-weight:600;
+      margin-bottom:8px;
+    }
+    
+    ul{margin:0;padding-left:20px}
+    li{margin:8px 0;color:var(--text)}
+    li::marker{color:var(--brand)}
+    
+    .callout{
+      border-left:4px solid var(--brand);
+      padding:16px 20px;
+      background:linear-gradient(135deg, rgba(59,130,246,.1), rgba(139,92,246,.05));
+      border-radius:8px;
+      margin:16px 0;
+    }
+    .callout::before{
+      content:'💡';
+      margin-right:8px;
+      font-size:16px;
+    }
+    
+    table{
+      width:100%;
+      border-collapse:collapse;
+      margin-top:16px;
+      background:white;
+      border-radius:12px;
+      overflow:hidden;
+      box-shadow:var(--shadow);
+    }
+    th,td{
+      padding:16px 20px;
+      text-align:left;
+      border-bottom:1px solid rgba(0,0,0,.06);
+    }
+    th{
+      color:var(--text);
+      font-weight:700;
+      background:linear-gradient(135deg, rgba(59,130,246,.1), rgba(139,92,246,.05));
+    }
+    tr:hover{background:rgba(59,130,246,.02)}
+    
+    .diagram{
+      background:var(--card);
+      border:1px solid rgba(0,0,0,.06);
+      border-radius:16px;
+      padding:20px;
+      overflow:auto;
+      box-shadow:var(--shadow);
+    }
+    
+    footer{
+      color:var(--muted);
+      text-align:center;
+      font-size:14px;
+      margin:48px 0 16px;
+      padding:24px;
+      background:white;
+      border-radius:16px;
+      box-shadow:var(--shadow);
+    }
+    
+    @media (max-width:720px){
+      header .title{font-size:36px}
+      .container{padding:20px}
+      .section-card{padding:24px}
+      .grid.cols-3{grid-template-columns:1fr}
+      .grid.cols-2{grid-template-columns:1fr}
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header class="hero" role="banner">
+      <h1 class="title">Name_Matcher – Business Process & Requirements</h1>
+      <p class="subtitle">A plain-language briefing for leaders and stakeholders. What it does, how it works, and what it needs to succeed.</p>
+      <div class="meta" aria-label="context chips">
+        <span class="pill">🎯 Batch name matching</span>
+        <span class="pill">📊 CSV/XLSX results</span>
+        <span class="pill">⚡ Optional GPU boost</span>
+        <span class="pill">🖥️ GUI for humans</span>
+      </div>
+    </header>
+
+    <!-- Executive Summary -->
+    <section aria-labelledby="exec">
+      <div class="section-card">
+        <h2 id="exec" class="section-title">Executive Summary</h2>
+        <div class="grid cols-3">
+          <div class="card">
+            <h3>🎯 Goal</h3>
+            <p>Find and connect records that describe the same person, quickly and accurately—even across two different databases.</p>
+          </div>
+          <div class="card">
+            <h3>✨ Benefits</h3>
+            <p>Cleaner data, fewer duplicates, better reporting. Saves review time by auto-accepting only very confident matches (95%+ score).</p>
+          </div>
+          <div class="card">
+            <h3>📦 What's Included</h3>
+            <p>Batch processing (streaming for big jobs), easy exports, friendly GUI, optional GPU boost, and a summary report for audit and KPIs.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Current Workflow & Use Cases -->
+    <section aria-labelledby="workflow">
+      <div class="section-card">
+        <h2 id="workflow" class="section-title">Current Workflow & Use Cases</h2>
+        <p class="lead">How people use Name_Matcher today—without the jargon.</p>
+        <div class="grid cols-3">
+          <div class="card">
+            <h3>🔄 Deduplicate One Database</h3>
+            <p>Remove repeated people within the same table or schema.</p>
+          </div>
+          <div class="card">
+            <h3>🔗 Cross-Database Match</h3>
+            <p>Connect people across two different databases to unify records.</p>
+          </div>
+          <div class="card">
+            <h3>📈 Review by Confidence</h3>
+            <p>Auto-accept fuzzy matches at ≥95% confidence only. Lower confidence fuzzy matches require human review.</p>
+          </div>
+        </div>
+        <div class="card" style="margin-top:20px">
+          <span class="badge">⏰ Typical run pattern</span>
+          <ul>
+            <li>Scheduled nightly/weekly batch runs for operations.</li>
+            <li>Ad-hoc runs in the GUI for analysts.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- Data Flow Diagram -->
+    <section aria-labelledby="flow">
+      <div class="section-card">
+        <h2 id="flow" class="section-title">How Data Moves Through the System</h2>
+        <div class="diagram">
+<pre class="mermaid">
+flowchart LR
+  A["📊 Database 1"] -->|"read in batches"| M("🔍 Matching Engine")
+  B["📊 Database 2 (optional)"] -->|"read in batches"| M
+  M -->|"save"| C["📄 CSV file"]
+  M -->|"save"| X["📈 XLSX file"]
+  M -->|"create"| S["📋 Summary report"]
+  subgraph Setup ["Setup"]
+    E["⚙️ GUI settings"] --> M
+  end
+</pre>
+        </div>
+        <div class="callout" style="margin-top:16px">
+          Exports include the full results (CSV/Excel) and a timestamped summary for quick reporting.
+        </div>
+      </div>
+    </section>
+
+    <!-- Components & Integrations -->
+    <section aria-labelledby="components">
+      <div class="section-card">
+        <h2 id="components" class="section-title">Components & Integration Points</h2>
+        <div class="grid cols-2">
+          <div class="card">
+            <h3>🗄️ Databases</h3>
+            <p>Connects to MySQL using safe, parameterized queries.</p>
+          </div>
+          <div class="card">
+            <h3>📤 Exports</h3>
+            <p>Produces CSV and Excel files your teams already know.</p>
+          </div>
+          <div class="card">
+            <h3>⚙️ Configuration</h3>
+            <p>Reads a simple .env file or uses the GUI—your choice.</p>
+          </div>
+          <div class="card">
+            <h3>🔍 Diagnostics</h3>
+            <p>Shows progress, hardware info, and (if enabled) GPU details.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Performance & Scale -->
+    <section aria-labelledby="perf">
+      <div class="section-card">
+        <h2 id="perf" class="section-title">Performance & Scalability</h2>
+        <div class="grid cols-3">
+          <div class="card">
+            <h3>📊 Big Data Ready</h3>
+            <p>Handles very large tables by reading in chunks (streaming) so memory use stays steady.</p>
+          </div>
+          <div class="card">
+            <h3>⚡ Fast Output</h3>
+            <p>Writes results efficiently; SSDs get extra tuning to go faster.</p>
+          </div>
+          <div class="card">
+            <h3>🎯 Adaptive</h3>
+            <p>Automatically adjusts batch size when free memory gets low.</p>
+          </div>
+          <div class="card">
+            <h3>🔄 Parallel</h3>
+            <p>Uses multiple CPU cores and database connections to keep things moving.</p>
+          </div>
+          <div class="card">
+            <h3>🛡️ Reliable</h3>
+            <p>If a long run stops, checkpoint files let you pick up where you left off.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+
+
+    <!-- Functional Requirements -->
+    <section aria-labelledby="fr">
+      <div class="section-card">
+        <h2 id="fr" class="section-title">What the System Must Do (Functional)</h2>
+        <ul>
+          <li>🔍 Match people using three approaches:
+            <ul>
+              <li><strong>Method 1:</strong> Strict checks using IDs, names, and birthdate.</li>
+              <li><strong>Method 2:</strong> A stricter version that also considers middle names.</li>
+              <li><strong>Method 3 (Fuzzy):</strong> A "best-guess" score based on how similar names look/sound. Birthdate must match.</li>
+            </ul>
+          </li>
+          <li>🔗 Work across one or two databases.</li>
+          <li>📊 Handle huge workloads by streaming; use in-memory for small jobs.</li>
+          <li>📤 Export results to CSV and/or Excel and create a timestamped summary.</li>
+          <li>📈 Only count fuzzy matches in summaries when the score is <strong>95%+</strong>.</li>
+          <li>🖥️ Let users run and monitor jobs in the GUI interface.</li>
+          <li>💾 Support checkpoints so long jobs can resume after interruptions.</li>
+          <li>⚡ Use the GPU for fuzzy matching if available; otherwise keep going on CPU.</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- Non-Functional Requirements -->
+    <section aria-labelledby="nfr">
+      <div class="section-card">
+        <h2 id="nfr" class="section-title">How It Should Behave (Non-Functional)</h2>
+        <div class="grid cols-3">
+          <div class="card">
+            <h3>⚡ Performance</h3>
+            <p>Stream data to keep memory steady; write files efficiently; tune for SSDs.</p>
+          </div>
+          <div class="card">
+            <h3>🔒 Security</h3>
+            <p>Use environment variables for credentials, avoid logging secrets, and prevent injection attacks.</p>
+          </div>
+          <div class="card">
+            <h3>🛡️ Reliability</h3>
+            <p>Clear error messages with fixes. Fall back to CPU when GPU isn't available.</p>
+          </div>
+          <div class="card">
+            <h3>👥 Usability</h3>
+            <p>Simple GUI with progress, ETA, and helpful status. User-friendly interface.</p>
+          </div>
+          <div class="card">
+            <h3>✅ Quality</h3>
+            <p>Unit/integration tests cover matching and exports.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Technical Constraints -->
+    <section aria-labelledby="tech">
+      <div class="section-card">
+        <h2 id="tech" class="section-title">Technical Constraints & Dependencies</h2>
+        <ul>
+          <li>🦀 Built in Rust; connects to MySQL; writes CSV/Excel.</li>
+          <li>🖥️ GUI uses modern Rust UI libraries; file pickers for convenience.</li>
+          <li>🎮 Optional GPU support requires a compatible NVIDIA driver and CUDA runtime.</li>
+          <li>🌐 Works on Windows and Linux; uses cross-platform file paths.</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- UI Requirements -->
+    <section aria-labelledby="ui">
+      <div class="section-card">
+        <h2 id="ui" class="section-title">User Interface Requirements</h2>
+        <div class="grid cols-2">
+          <div class="card">
+            <h3>🖥️ GUI Interface</h3>
+            <ul>
+              <li>Connect to one or two databases with simple forms.</li>
+              <li>Pick tables, choose method, choose where to save results.</li>
+              <li>Advanced: pool size, batch size, memory threshold, SSD mode, GPU toggle + memory budget.</li>
+              <li>Buttons: Test Connection, Run, Pause/Cancel, Generate .env, Load .env, CUDA Diagnostics.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>📊 Progress & Feedback</h3>
+            <ul>
+              <li>Real-time progress bar with ETA and records per second.</li>
+              <li>Memory usage monitoring and alerts.</li>
+              <li>Clear success/error messages with actionable guidance.</li>
+              <li>File location display after completion.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Database Requirements -->
+    <section aria-labelledby="db">
+      <div class="section-card">
+        <h2 id="db" class="section-title">Database Requirements & Compatibility</h2>
+        <ul>
+          <li>🔄 Works with optional fields like middle name and birthdate; safely handles missing values.</li>
+          <li>⚡ For best speed, add indexes on name fields and birthdate.</li>
+          <li>🆔 Supports an optional UUID in the second table when needed.</li>
+        </ul>
+        <div class="callout" style="margin-top:16px">
+          The system is careful with missing data so matches remain fair and predictable.
+        </div>
+      </div>
+    </section>
+
+    <!-- GPU Requirements -->
+    <section aria-labelledby="gpu">
+      <div class="section-card">
+        <h2 id="gpu" class="section-title">GPU Acceleration (Optional) & Fallbacks</h2>
+        <ul>
+          <li>🎮 When available, the GPU can speed up fuzzy matching significantly.</li>
+          <li>🛡️ If the GPU isn't available or fails, the job continues on CPU without crashing.</li>
+          <li>🔍 Users can see GPU/driver details in the diagnostics panel.</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- Configuration & Environment -->
+    <section aria-labelledby="config">
+      <div class="section-card">
+        <h2 id="config" class="section-title">Configuration & Environment</h2>
+        <ul>
+          <li>⚙️ Settings come from a .env file or are set directly in the GUI.</li>
+          <li>💾 Checkpoints (saved next to your output) let you resume long jobs.</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- Threshold Policy -->
+    <section aria-labelledby="threshold">
+      <div class="section-card">
+        <h2 id="threshold" class="section-title">Summary Reports & Confidence Threshold</h2>
+        <p class="lead">📊 Only fuzzy matches with a score of <strong>95% or higher</strong> are counted in the summary statistics. Lower scores are excluded from totals and derived metrics.</p>
+      </div>
+    </section>
+
+    <!-- Process Diagrams -->
+    <section aria-labelledby="diagrams">
+      <div class="section-card">
+        <h2 id="diagrams" class="section-title">Process Diagrams</h2>
+        <div class="diagram" style="margin-bottom:20px">
+<pre class="mermaid">
+flowchart TD
+  S[🚀 Start] --> C[⚙️ Configure Databases and Tables]
+  C --> A[🎯 Choose Method & Mode]
+  A --> O[📤 Choose Output]
+  O --> V[🔍 Test Connection]
+  V -->|✅ OK| R[▶️ Run Matching]
+  V -->|❌ Fail| E[🔧 Fix Settings]
+  R --> P[📊 Track Progress & ETA]
+  P --> W[💾 Write CSV/XLSX]
+  W --> Y[📋 Generate Summary]
+  Y --> D[🔍 Optional Diagnostics]
+  D --> F[✅ Finish]
+</pre>
+        </div>
+        <div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  participant DB1 as 📊 Database 1
+  participant DB2 as 📊 Database 2
+  participant Engine as 🔍 Engine
+  participant Export as 📤 Export
+  DB1->>Engine: Read rows (batches)
+  DB2->>Engine: Read rows (optional)
+  Engine->>Engine: Match (Strict / Enhanced / Fuzzy)
+  Engine->>Export: Write results
+  Engine->>Export: Summarize (count fuzzy ≥ 0.95)
+  Export-->>User: 📊 Results + Summary
+</pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- Roadmap & Risks -->
+    <section aria-labelledby="plan">
+      <div class="section-card">
+        <h2 id="plan" class="section-title">Implementation Roadmap & Risks</h2>
+        <div class="grid cols-2">
+          <div class="card">
+            <h3>🎯 Near Term</h3>
+            <ul>
+              <li>Keep the 95% rule consistent everywhere in GUI.</li>
+              <li>Strengthen diagnostics; allow easy sharing when requesting support.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>🚀 Future Ideas</h3>
+            <ul>
+              <li>Support more databases (e.g., PostgreSQL).</li>
+              <li>Job files (JSON/YAML) for repeatable runs; richer audit bundles.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>⚠️ Key Risks</h3>
+            <ul>
+              <li>GPU/driver issues → mitigate with diagnostics and CPU fallback.</li>
+              <li>Very large runs → use streaming, SSD tuning, and connection pools.</li>
+              <li>Schema differences → validate early; show clear fixes.</li>
+              <li>Sensitive data → keep secrets out of logs; use env vars.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Traceability -->
+    <section aria-labelledby="trace">
+      <div class="section-card">
+        <h2 id="trace" class="section-title">Business Needs → Requirements</h2>
+        <table aria-label="traceability matrix">
+          <thead>
+            <tr>
+              <th>🎯 Business Need</th>
+              <th>✅ Requirement Coverage</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Accurate deduplication</td>
+              <td>Three matching methods; streaming support; summary rules</td>
+            </tr>
+            <tr>
+              <td>High confidence only</td>
+              <td>Summaries count fuzzy matches only at ≥ 95%</td>
+            </tr>
+            <tr>
+              <td>Scale & speed</td>
+              <td>Streaming, batching, parallel work, SSD tuning</td>
+            </tr>
+            <tr>
+              <td>Operational fit</td>
+              <td>GUI for people, clear outputs, progress tracking</td>
+            </tr>
+            <tr>
+              <td>Security</td>
+              <td>Env-based credentials, parameterized queries, redacted logs</td>
+            </tr>
+            <tr>
+              <td>Supportability</td>
+              <td>Diagnostics, progress, and clear error messages</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Appendix: Specs -->
+    <section aria-labelledby="appendix">
+      <div class="section-card">
+        <h2 id="appendix" class="section-title">Appendix: GUI Specifications</h2>
+        <div class="grid cols-2">
+          <div class="card">
+            <h3>🖥️ Main Interface</h3>
+            <p>Panels for connections, tables, controls, and diagnostics; buttons for Test, Run, Pause/Cancel, Generate/Load .env, and CUDA Diagnostics.</p>
+          </div>
+          <div class="card">
+            <h3>📊 Monitoring</h3>
+            <p>Real-time progress tracking, memory usage, ETA calculations, and comprehensive status reporting throughout the matching process.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <footer>© 2025 Name_Matcher — Executive Presentation</footer>
+  </div>
+
+  <script>
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: 'base',
+      themeVariables: {
+        primaryColor: '#3b82f6',
+        primaryTextColor: '#1e293b',
+        primaryBorderColor: '#3b82f6',
+        lineColor: '#3b82f6',
+        secondaryColor: '#8b5cf6',
+        tertiaryColor: '#10b981'
+      }
+    });
+  </script>
+</body>
+</html>
+
+

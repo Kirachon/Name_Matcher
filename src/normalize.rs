@@ -19,10 +19,10 @@ pub fn normalize_text(input: &str) -> String {
 pub fn normalize_person(p: &Person) -> NormalizedPerson {
     NormalizedPerson {
         id: p.id,
-        uuid: p.uuid.clone(),
-        first_name: normalize_text(&p.first_name),
-        middle_name: p.middle_name.as_ref().map(|m| normalize_text(m)),
-        last_name: normalize_text(&p.last_name),
+        uuid: p.uuid.clone().unwrap_or_default(),
+        first_name: p.first_name.as_deref().map(normalize_text),
+        middle_name: p.middle_name.as_deref().map(normalize_text),
+        last_name: p.last_name.as_deref().map(normalize_text),
         birthdate: p.birthdate,
     }
 }
@@ -42,10 +42,10 @@ mod tests {
 
     #[test]
     fn test_normalize_person() {
-        let p = Person { id: 1, uuid: "u".into(), first_name: "Éva".into(), middle_name: None, last_name: "Łukasz".into(), birthdate: NaiveDate::from_ymd_opt(2000,1,2).unwrap() };
+        let p = Person { id: 1, uuid: Some("u".into()), first_name: Some("Éva".into()), middle_name: None, last_name: Some("Łukasz".into()), birthdate: NaiveDate::from_ymd_opt(2000,1,2) };
         let n = normalize_person(&p);
-        assert_eq!(n.first_name, "eva");
-        assert_eq!(n.last_name, "łukasz");
+        assert_eq!(n.first_name.as_deref(), Some("eva"));
+        assert_eq!(n.last_name.as_deref(), Some("łukasz"));
     }
 }
 

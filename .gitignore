@@ -424,3 +424,32 @@ FodyWeavers.xsd
 # Added by cargo
 
 /target
+
+
+# Name_Matcher project additions
+.DS_Store
+Thumbs.db
+desktop.ini
+.Trash*/
+# Vim/Swap files
+*.swp
+*.swo
+# Build directories
+/dist/
+/build/
+# Compiled binaries
+*.exe
+*.dll
+*.so
+# Additional dependencies caches
+.cargo/registry/
+# Logs and caches
+.cache/
+/tmp/
+# Environment files and virtual envs
+.env
+.env.*
+venv/
+.virtualenv/
+# OS temp
+*.temp
