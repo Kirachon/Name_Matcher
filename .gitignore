@@ -453,3 +453,8 @@ venv/
 .virtualenv/
 # OS temp
 *.temp
+
+# Data files (excluded from VCS)
+*.csv
+*.xlsx
+*.xls
