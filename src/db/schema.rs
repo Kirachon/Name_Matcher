@@ -11,12 +11,13 @@ fn build_select_list(mapping: Option<&ColumnMapping>) -> Result<String> {
     let m = mapping.cloned().unwrap_or_default();
     // Validate each column ident when provided
     fn val(id: &str) -> Result<()> { super::schema::validate_ident(id) }
-    val(&m.id)?; val(&m.uuid)?; val(&m.first_name)?; val(&m.last_name)?; val(&m.birthdate)?;
+    val(&m.id)?; val(&m.first_name)?; val(&m.last_name)?; val(&m.birthdate)?;
     if let Some(ref mid) = m.middle_name { val(mid)?; }
     let mid_sql = if let Some(mid) = m.middle_name.as_ref() { format!("`{}` AS middle_name", mid) } else { "NULL AS middle_name".to_string() };
+    let uuid_sql = if let Some(ref u) = m.uuid { val(u)?; format!("`{}` AS uuid", u) } else { "NULL AS uuid".to_string() };
     Ok(format!(
-        "`{id}` AS id, `{uuid}` AS uuid, `{first}` AS first_name, {mid}, `{last}` AS last_name, DATE(`{bd}`) AS birthdate",
-        id = m.id, uuid = m.uuid, first = m.first_name, mid = mid_sql, last = m.last_name, bd = m.birthdate
+        "`{id}` AS id, {uuid} , `{first}` AS first_name, {mid}, `{last}` AS last_name, DATE(`{bd}`) AS birthdate",
+        id = m.id, uuid = uuid_sql, first = m.first_name, mid = mid_sql, last = m.last_name, bd = m.birthdate
     ))
 }
 
@@ -66,16 +67,29 @@ pub async fn discover_table_columns(pool: &MySqlPool, database: &str, table: &st
 
 pub async fn get_person_rows(pool: &MySqlPool, table: &str) -> Result<Vec<Person>> {
     validate_ident(table)?;
-    // safe-ish table name injection after validation
-    let sql = format!(
+    let sql1 = format!(
         "SELECT id, uuid, first_name, middle_name, last_name, DATE(birthdate) AS birthdate FROM `{}`",
         table
     );
-    let rows: Vec<Person> = sqlx::query_as::<MySql, Person>(&sql)
-        .fetch_all(pool)
-        .await
-        .with_context(|| format!("Failed to fetch rows from {}", table))?;
-    Ok(rows)
+    match sqlx::query_as::<MySql, Person>(&sql1).fetch_all(pool).await {
+        Ok(rows) => Ok(rows),
+        Err(e) => {
+            let unknown_uuid = matches!(e, sqlx::Error::Database(ref db) if db.message().contains("Unknown column") && db.message().contains("uuid"));
+            if unknown_uuid {
+                let sql2 = format!(
+                    "SELECT id, NULL AS uuid, first_name, middle_name, last_name, DATE(birthdate) AS birthdate FROM `{}`",
+                    table
+                );
+                let rows: Vec<Person> = sqlx::query_as::<MySql, Person>(&sql2)
+                    .fetch_all(pool)
+                    .await
+                    .with_context(|| format!("Failed to fetch rows from {} (uuid missing)", table))?;
+                Ok(rows)
+            } else {
+                Err(e).with_context(|| format!("Failed to fetch rows from {}", table))
+            }
+        }
+    }
 }
 
 
@@ -120,8 +134,24 @@ pub async fn get_person_rows_where(pool: &MySqlPool, table: &str, where_sql: &st
     let sql = format!("SELECT {select} FROM `{table}` WHERE {where}", select=select, table=table, where=where_sql);
     let mut q = sqlx::query_as::<MySql, Person>(&sql);
     for b in binds { q = match b { SqlBind::I64(v) => q.bind(*v), SqlBind::Str(s) => q.bind(s) }; }
-    let rows = q.fetch_all(pool).await.with_context(|| format!("Failed to fetch rows from {} with filter", table))?;
-    Ok(rows)
+    match q.fetch_all(pool).await {
+        Ok(rows) => Ok(rows),
+        Err(e) => {
+            let unknown_uuid = matches!(e, sqlx::Error::Database(ref db) if db.message().contains("Unknown column") && db.message().contains("uuid"));
+            if unknown_uuid {
+                let mut m2 = mapping.cloned().unwrap_or_default();
+                m2.uuid = None;
+                let select2 = build_select_list(Some(&m2))?;
+                let sql2 = format!("SELECT {select} FROM `{table}` WHERE {where}", select=select2, table=table, where=where_sql);
+                let mut q2 = sqlx::query_as::<MySql, Person>(&sql2);
+                for b in binds { q2 = match b { SqlBind::I64(v) => q2.bind(*v), SqlBind::Str(s) => q2.bind(s) }; }
+                let rows = q2.fetch_all(pool).await.with_context(|| format!("Failed to fetch rows from {} with filter (uuid missing)", table))?;
+                Ok(rows)
+            } else {
+                Err(e).with_context(|| format!("Failed to fetch rows from {} with filter", table))
+            }
+        }
+    }
 }
 
 pub async fn fetch_person_rows_chunk_where(pool: &MySqlPool, table: &str, offset: i64, limit: i64, where_sql: &str, binds: &[SqlBind], mapping: Option<&ColumnMapping>) -> Result<Vec<Person>> {
@@ -130,22 +160,54 @@ pub async fn fetch_person_rows_chunk_where(pool: &MySqlPool, table: &str, offset
     let sql = format!("SELECT {select} FROM `{table}` WHERE {where} ORDER BY id LIMIT ? OFFSET ?", select=select, table=table, where=where_sql);
     let mut q = sqlx::query_as::<MySql, Person>(&sql);
     for b in binds { q = match b { SqlBind::I64(v) => q.bind(*v), SqlBind::Str(s) => q.bind(s) }; }
-    let rows: Vec<Person> = q.bind(limit).bind(offset).fetch_all(pool).await
-        .with_context(|| format!("Failed to fetch chunk from {} (offset {}, limit {}) with filter", table, offset, limit))?;
-    Ok(rows)
+    let mut q = q.bind(limit).bind(offset);
+    match q.fetch_all(pool).await {
+        Ok(rows) => Ok(rows),
+        Err(e) => {
+            let unknown_uuid = matches!(e, sqlx::Error::Database(ref db) if db.message().contains("Unknown column") && db.message().contains("uuid"));
+            if unknown_uuid {
+                let mut m2 = mapping.cloned().unwrap_or_default();
+                m2.uuid = None;
+                let select2 = build_select_list(Some(&m2))?;
+                let sql2 = format!("SELECT {select} FROM `{table}` WHERE {where} ORDER BY id LIMIT ? OFFSET ?", select=select2, table=table, where=where_sql);
+                let mut q2 = sqlx::query_as::<MySql, Person>(&sql2);
+                for b in binds { q2 = match b { SqlBind::I64(v) => q2.bind(*v), SqlBind::Str(s) => q2.bind(s) }; }
+                let rows: Vec<Person> = q2.bind(limit).bind(offset).fetch_all(pool).await
+                    .with_context(|| format!("Failed to fetch chunk from {} (offset {}, limit {}) with filter and uuid missing", table, offset, limit))?;
+                Ok(rows)
+            } else {
+                Err(e).with_context(|| format!("Failed to fetch chunk from {} (offset {}, limit {}) with filter", table, offset, limit))
+            }
+        }
+    }
 }
 
 pub async fn fetch_person_rows_chunk(pool: &MySqlPool, table: &str, offset: i64, limit: i64) -> Result<Vec<Person>> {
     validate_ident(table)?;
-    let sql = format!(
+    let sql1 = format!(
         "SELECT id, uuid, first_name, middle_name, last_name, DATE(birthdate) AS birthdate FROM `{}` ORDER BY id LIMIT ? OFFSET ?",
         table
     );
-    let rows: Vec<Person> = sqlx::query_as::<MySql, Person>(&sql)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await
-        .with_context(|| format!("Failed to fetch chunk from {} (offset {}, limit {})", table, offset, limit))?;
-    Ok(rows)
+    let mut q1 = sqlx::query_as::<MySql, Person>(&sql1).bind(limit).bind(offset);
+    match q1.fetch_all(pool).await {
+        Ok(rows) => Ok(rows),
+        Err(e) => {
+            let unknown_uuid = matches!(e, sqlx::Error::Database(ref db) if db.message().contains("Unknown column") && db.message().contains("uuid"));
+            if unknown_uuid {
+                let sql2 = format!(
+                    "SELECT id, NULL AS uuid, first_name, middle_name, last_name, DATE(birthdate) AS birthdate FROM `{}` ORDER BY id LIMIT ? OFFSET ?",
+                    table
+                );
+                let rows: Vec<Person> = sqlx::query_as::<MySql, Person>(&sql2)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(pool)
+                    .await
+                    .with_context(|| format!("Failed to fetch chunk from {} (offset {}, limit {}) with uuid missing", table, offset, limit))?;
+                Ok(rows)
+            } else {
+                Err(e).with_context(|| format!("Failed to fetch chunk from {} (offset {}, limit {})", table, offset, limit))
+            }
+        }
+    }
 }

@@ -1,0 +1,124 @@
+DELIMITER //
+
+CREATE PROCEDURE 4PsMatch_HH_Final_Batched_v2()
+BEGIN
+    -- Define batch size
+    DECLARE batch_size INT DEFAULT 1000;
+    DECLARE rows_to_process INT DEFAULT 0;
+    DECLARE max_uuid_processed VARCHAR(40) DEFAULT '';
+
+    -- 1. Setup and Cleanup
+    DROP TABLE IF EXISTS 4pshh_matched_v3;
+    DROP TEMPORARY TABLE IF EXISTS temp_cbms_hh_counts;
+    DROP TEMPORARY TABLE IF EXISTS temp_matched_members_count;
+    DROP TEMPORARY TABLE IF EXISTS temp_uuid_batching;
+
+    -- Create the final results table with all required columns
+    CREATE TABLE 4pshh_matched_v3 (
+        id INT PRIMARY KEY AUTO_INCREMENT,
+        uuid VARCHAR(40) NOT NULL,
+        hh_id VARCHAR(30) NOT NULL,
+        region_code CHAR(10),
+        poor_hat_0 INT,
+        poor_hat_10 INT, -- Assume INT, corrected from original missing type
+        match_percentage DECIMAL(5, 2) NOT NULL
+    );
+
+    -- 2. Stage CBMS Household Member Counts (This runs once, not in the loop)
+    CREATE TEMPORARY TABLE temp_cbms_hh_counts AS
+    SELECT 
+        uuid, 
+        COUNT(*) AS total_members
+    FROM 
+        cbms_household_members_matched
+    GROUP BY 
+        uuid;
+
+    -- 3. Stage unique CBMS UUIDs for controlled batching
+    CREATE TEMPORARY TABLE temp_uuid_batching (
+        uuid VARCHAR(40) PRIMARY KEY
+    );
+    INSERT INTO temp_uuid_batching (uuid)
+    SELECT DISTINCT uuid FROM cbms_household_members_matched ORDER BY uuid;
+    
+    -- Get total count of unique HHs to process
+    SELECT COUNT(*) INTO rows_to_process FROM temp_uuid_batching;
+
+    -- Reset batch tracker
+    SET max_uuid_processed = '';
+
+    -- 4. Start Batch Processing Loop (Runs 10,000 UUIDs at a time)
+    WHILE rows_to_process > 0 DO
+        
+        -- Get the next batch of UUIDs to process, ordered alphabetically/lexicographically
+        CREATE TEMPORARY TABLE temp_batch_uuids AS
+        SELECT uuid
+        FROM temp_uuid_batching
+        WHERE uuid > max_uuid_processed
+        ORDER BY uuid
+        LIMIT batch_size;
+
+        -- Get the largest UUID in the current batch to set the next starting point
+        SELECT MAX(uuid) INTO max_uuid_processed FROM temp_batch_uuids;
+
+        -- Clear the match count table for this batch
+        DROP TEMPORARY TABLE IF EXISTS temp_matched_members_count;
+        
+        -- CTE 2: Find and count individually matched members for the current batch
+        -- NOTE: We must select region_code, poor_hat_0, poor_hat_10 from one record per UUID
+        CREATE TEMPORARY TABLE temp_matched_members_count AS
+        SELECT
+            T1.uuid,
+            MAX(T1.region_code) AS region_code, -- Use MAX to pick one representative value per group
+            MAX(T1.poor_hat_0) AS poor_hat_0,
+            MAX(T1.poor_hat_10) AS poor_hat_10,
+            T2.hh_id,
+            COUNT(*) AS matched_members
+        FROM
+            cbms_household_members_matched T1
+        INNER JOIN
+            raw_4ps_aug2025 T2 ON T2.last_name = T1.last_name
+                             AND T2.first_name = T1.first_name
+                             AND T2.birthdate = T1.birthdate
+        INNER JOIN 
+            temp_batch_uuids B ON T1.uuid = B.uuid -- Filter to the current batch
+        GROUP BY
+            T1.uuid, T2.hh_id;
+        
+        -- 4. Insert the final results for the current batch
+        INSERT INTO 4pshh_matched_v3 (uuid, hh_id, region_code, poor_hat_0, poor_hat_10, match_percentage)
+        SELECT 
+            T1.uuid,
+            T1.hh_id,
+            T1.region_code, -- Include the new columns
+            T1.poor_hat_0,
+            T1.poor_hat_10,
+            (T1.matched_members / T2.total_members) * 100
+        FROM 
+            temp_matched_members_count T1
+        INNER JOIN 
+            temp_cbms_hh_counts T2 
+            ON T1.uuid = T2.uuid
+        WHERE 
+            (T1.matched_members / T2.total_members) > 0.50;
+
+        -- Update the count of remaining UUIDs
+        SET rows_to_process = rows_to_process - batch_size;
+        
+        -- Drop the batch table for the next iteration
+        DROP TEMPORARY TABLE temp_batch_uuids;
+        
+    END WHILE;
+
+
+    -- 5. Final Clean up
+    DROP TEMPORARY TABLE temp_cbms_hh_counts;
+    DROP TEMPORARY TABLE temp_matched_members_count;
+    DROP TEMPORARY TABLE temp_uuid_batching;
+
+END //
+
+DELIMITER ;
+
+-- Call the procedure to run the matching process
+CALL 4PsMatch_HH_Final_Batched_v2();
