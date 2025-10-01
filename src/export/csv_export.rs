@@ -4,14 +4,18 @@ use anyhow::Result;
 use csv::Writer;
 
 pub fn export_to_csv(results: &[MatchPair], path: &str, algorithm: MatchingAlgorithm, fuzzy_min_confidence: f32) -> Result<()> {
-    let mut w = Writer::from_path(path)?;
+    use std::fs::File;
+    use std::io::BufWriter;
+    let file = File::create(path)?;
+    let buf = BufWriter::with_capacity(64 * 1024, file);
+    let mut w = Writer::from_writer(buf);
     write_headers(&mut w, algorithm)?;
     for pair in results { write_pair(&mut w, pair, algorithm, fuzzy_min_confidence)?; }
     w.flush()?;
     Ok(())
 }
 
-fn write_headers(w: &mut Writer<std::fs::File>, algorithm: MatchingAlgorithm) -> Result<()> {
+fn write_headers<W: std::io::Write>(w: &mut Writer<W>, algorithm: MatchingAlgorithm) -> Result<()> {
     let headers = match algorithm {
         MatchingAlgorithm::IdUuidYasIsMatchedInfnbd => vec![
             "Table1_ID", "Table1_UUID", "Table1_FirstName", "Table1_LastName", "Table1_Birthdate",
@@ -23,17 +27,18 @@ fn write_headers(w: &mut Writer<std::fs::File>, algorithm: MatchingAlgorithm) ->
             "Table2_ID", "Table2_UUID", "Table2_FirstName", "Table2_MiddleName", "Table2_LastName", "Table2_Birthdate",
             "is_matched_Infnmnbd", "Confidence", "MatchedFields",
         ],
-        MatchingAlgorithm::Fuzzy | MatchingAlgorithm::FuzzyNoMiddle | MatchingAlgorithm::HouseholdGpu => vec![
+        MatchingAlgorithm::Fuzzy | MatchingAlgorithm::FuzzyNoMiddle | MatchingAlgorithm::HouseholdGpu | MatchingAlgorithm::HouseholdGpuOpt6 => vec![
             "Table1_ID", "Table1_UUID", "Table1_FirstName", "Table1_MiddleName", "Table1_LastName", "Table1_Birthdate",
             "Table2_ID", "Table2_UUID", "Table2_FirstName", "Table2_MiddleName", "Table2_LastName", "Table2_Birthdate",
             "is_matched_Fuzzy", "Confidence", "MatchedFields",
         ],
+        MatchingAlgorithm::FuzzyBirthdate => { anyhow::bail!("Algorithm 7 (FuzzyBirthdate) has been deprecated and is not supported for export") }
     };
     w.write_record(&headers)?;
     Ok(())
 }
 
-fn write_pair(w: &mut Writer<std::fs::File>, pair: &MatchPair, algorithm: MatchingAlgorithm, fuzzy_min_confidence: f32) -> Result<()> {
+fn write_pair<W: std::io::Write>(w: &mut Writer<W>, pair: &MatchPair, algorithm: MatchingAlgorithm, fuzzy_min_confidence: f32) -> Result<()> {
     match algorithm {
         MatchingAlgorithm::IdUuidYasIsMatchedInfnbd => {
             w.write_record(&[
@@ -94,10 +99,11 @@ fn write_pair(w: &mut Writer<std::fs::File>, pair: &MatchPair, algorithm: Matchi
                 pair.matched_fields.join(","),
             ])?;
         }
-        MatchingAlgorithm::HouseholdGpu => {
+        MatchingAlgorithm::HouseholdGpu | MatchingAlgorithm::HouseholdGpuOpt6 => {
             // Not applicable for person-level writer
             return Ok(());
         }
+        MatchingAlgorithm::FuzzyBirthdate => { anyhow::bail!("Algorithm 7 (FuzzyBirthdate) has been deprecated and is not supported for export") }
     }
     Ok(())
 }

@@ -458,3 +458,52 @@ venv/
 *.csv
 *.xlsx
 *.xls
+
+# Rust-specific additions
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# Name_Matcher project-specific
+# Checkpoint and state files
+*.nmckpt
+engine_ck.db
+*.db
+
+# User profile and configuration files
+.nm_opt_profile
+.nm_fuzzy_threshold
+*.nm_opt_profile
+
+# Benchmark and test data
+benchmark_test.json
+test_data/
+*.sql.gz
+*.tar.gz
+
+# Personal notes and drafts
+notes.md
+draft*.md
+temp.md
+todo.md
+scratch.md
+NOTES.md
+TODO.md
+
+# Docker overrides
+docker-compose.override.yml
+
+# IDE-specific (additional)
+.idea/
+*.iml
+.fleet/
+
+# Certificates and keys
+*.pem
+*.key
+*.crt
+*.p12
+
+# Environment templates are tracked, but actual env files are not
+!.env.example
+!.env.template

@@ -42,7 +42,7 @@ mod tests {
 
     #[test]
     fn test_normalize_person() {
-        let p = Person { id: 1, uuid: Some("u".into()), first_name: Some("Éva".into()), middle_name: None, last_name: Some("Łukasz".into()), birthdate: NaiveDate::from_ymd_opt(2000,1,2) };
+        let p = Person { id: 1, uuid: Some("u".into()), first_name: Some("Éva".into()), middle_name: None, last_name: Some("Łukasz".into()), birthdate: NaiveDate::from_ymd_opt(2000,1,2), hh_id: None };
         let n = normalize_person(&p);
         assert_eq!(n.first_name.as_deref(), Some("eva"));
         assert_eq!(n.last_name.as_deref(), Some("łukasz"));
