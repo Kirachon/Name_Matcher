@@ -49,7 +49,8 @@ async fn main() -> Result<()> {
     let t2: Vec<Person> = get_person_rows(&pool, "sample_b").await.context("fetch B")?;
     println!("[gpu_audit] Loaded: A={} rows, B={} rows", t1.len(), t2.len());
 
-    // 4) Run fuzzy with GPU
+    // 4) Run fuzzy with GPU (with GPU fuzzy metrics enabled)
+    name_matcher::matching::set_gpu_fuzzy_metrics(true);
     let opts = MatchOptions {
         backend: ComputeBackend::Gpu,
         gpu: Some(GpuConfig { device_id: None, mem_budget_mb: 1024 }),
@@ -65,11 +66,35 @@ async fn main() -> Result<()> {
     let dur = start.elapsed();
     println!("[gpu_audit] Fuzzy GPU done: {} pairs, elapsed: {:.3}s", pairs.len(), dur.as_secs_f32());
 
-    // 5) CPU baseline
+    // 6) CPU baseline
     let start2 = Instant::now();
     let _pairs_cpu = match_all_with_opts(&t1, &t2, MatchingAlgorithm::Fuzzy, MatchOptions { backend: ComputeBackend::Cpu, gpu: None, progress: ProgressConfig::default() }, |_| {});
     let dur2 = start2.elapsed();
     println!("[gpu_audit] Fuzzy CPU baseline elapsed: {:.3}s", dur2.as_secs_f32());
+
+    // 7) Streaming GPU hash-join microbench (Algorithms 1 & 2)
+    let mut discard = |_: &name_matcher::matching::MatchPair| -> Result<()> { Ok(()) };
+    let mut on_prog = |_u: ProgressUpdate| { /* suppress */ };
+    let mut scfg = name_matcher::matching::StreamingConfig::default();
+    scfg.use_gpu_hash_join = true;
+    scfg.use_gpu_build_hash = true;
+    scfg.use_gpu_probe_hash = true;
+    scfg.gpu_probe_batch_mb = 256;
+    scfg.batch_size = 20000;
+
+    // Single stream (no overlap)
+    scfg.gpu_streams = 1;
+    let t_start = Instant::now();
+    let _ = name_matcher::matching::stream_match_csv(&pool, "sample_a", "sample_b", MatchingAlgorithm::IdUuidYasIsMatchedInfnbd, &mut discard, scfg.clone(), &on_prog, None).await?;
+    let dur_s1 = t_start.elapsed();
+
+    // Double stream (overlap on)
+    scfg.gpu_streams = 2; scfg.gpu_buffer_pool = true;
+    let t_start2 = Instant::now();
+    let _ = name_matcher::matching::stream_match_csv(&pool, "sample_a", "sample_b", MatchingAlgorithm::IdUuidYasIsMatchedInfnbd, &mut discard, scfg.clone(), &on_prog, None).await?;
+    let dur_s2 = t_start2.elapsed();
+
+    println!("[gpu_audit] GPU hash join A1: streams=1 {:.3}s | streams=2 {:.3}s (batch {} rows)", dur_s1.as_secs_f32(), dur_s2.as_secs_f32(), scfg.batch_size);
 
     Ok(())
 }

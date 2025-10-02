@@ -17,7 +17,7 @@ use std::fs;
 use name_matcher::config::DatabaseConfig;
 use name_matcher::db::make_pool_with_size;
 use name_matcher::db::{get_person_rows, get_person_count};
-use name_matcher::matching::{stream_match_csv, stream_match_csv_dual, match_all_progress, match_all_with_opts, match_households_gpu_inmemory, ProgressConfig, MatchingAlgorithm, ProgressUpdate, StreamingConfig, StreamControl, ComputeBackend, MatchOptions, GpuConfig};
+use name_matcher::matching::{stream_match_csv, stream_match_csv_dual, match_all_progress, match_all_with_opts, match_households_gpu_inmemory, match_households_gpu_inmemory_opt6, ProgressConfig, MatchingAlgorithm, ProgressUpdate, StreamingConfig, StreamControl, ComputeBackend, MatchOptions, GpuConfig};
 use name_matcher::export::csv_export::{CsvStreamWriter, HouseholdCsvWriter};
 use name_matcher::export::xlsx_export::{XlsxStreamWriter, SummaryContext, export_households_xlsx};
 
@@ -51,6 +51,10 @@ enum ErrorCategory {
     Configuration,
     Unknown,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum FuzzyGpuMode { Off, Auto, Force }
+
 
 #[derive(Debug, Clone, Serialize)]
 struct DiagEvent {
@@ -157,11 +161,15 @@ struct GuiApp {
     // Granular GPU hash-join controls
     use_gpu_build_hash: bool,
     use_gpu_probe_hash: bool,
+    // Fuzzy GPU mode (Off/Auto/Force)
+    fuzzy_gpu_mode: FuzzyGpuMode,
+
     // New options
     use_gpu_fuzzy_direct_hash: bool,
     direct_norm_fuzzy: bool,
-    gpu_mem_mb: String,           // fuzzy/in-memory GPU mem budget
-    gpu_probe_mem_mb: String,     // advisory GPU mem for probe batches
+    gpu_mem_mb: String,           // fuzzy/in-memory GPU mem budget (metrics kernels and tiling)
+    gpu_probe_mem_mb: String,     // advisory GPU mem for probe batches (A1/A2 streaming)
+    gpu_fuzzy_prep_mem_mb: String, // dedicated VRAM budget for fuzzy pre-pass hashing (A3/A4)
 
     // Fuzzy threshold (percent 60..100) persisted across sessions
     fuzzy_threshold_pct: i32,
@@ -350,6 +358,8 @@ impl Default for GuiApp {
             batch_size: "50000".into(),
             mem_thresh: "800".into(),
             use_gpu: false,
+            fuzzy_gpu_mode: FuzzyGpuMode::Off,
+
             use_gpu_hash_join: false,
             use_gpu_build_hash: true,
             use_gpu_probe_hash: true,
@@ -359,6 +369,7 @@ impl Default for GuiApp {
 
             gpu_mem_mb: "512".into(),
             gpu_probe_mem_mb: "256".into(),
+            gpu_fuzzy_prep_mem_mb: "256".into(),
             fuzzy_threshold_pct: thr,
             gpu_build_active_now: false,
             gpu_probe_active_now: false,
@@ -405,7 +416,7 @@ impl Default for GuiApp {
 impl GuiApp {
     fn save_opt_profile(&mut self) {
         let content = format!(
-            "pool_size={}\nbatch_size={}\nmem_thresh_mb={}\nuse_gpu={}\nuse_gpu_hash_join={}\nuse_gpu_build_hash={}\nuse_gpu_probe_hash={}\nuse_gpu_fuzzy_direct_hash={}\ndirect_norm_fuzzy={}\ngpu_mem_mb={}\ngpu_probe_mem_mb={}\nssd_storage={}\n",
+            "pool_size={}\nbatch_size={}\nmem_thresh_mb={}\nuse_gpu={}\nuse_gpu_hash_join={}\nuse_gpu_build_hash={}\nuse_gpu_probe_hash={}\nuse_gpu_fuzzy_direct_hash={}\ndirect_norm_fuzzy={}\ngpu_mem_mb={}\ngpu_probe_mem_mb={}\ngpu_fuzzy_prep_mem_mb={}\nssd_storage={}\n",
             self.pool_size,
             self.batch_size,
             self.mem_thresh,
@@ -417,6 +428,7 @@ impl GuiApp {
             self.direct_norm_fuzzy,
             self.gpu_mem_mb,
             self.gpu_probe_mem_mb,
+            self.gpu_fuzzy_prep_mem_mb,
             self.ssd_storage,
         );
         match std::fs::write(".nm_opt_profile", content) {
@@ -442,8 +454,13 @@ impl GuiApp {
                             "use_gpu_probe_hash" => { self.use_gpu_probe_hash = v.eq_ignore_ascii_case("true") || v=="1"; }
                             "use_gpu_fuzzy_direct_hash" => { self.use_gpu_fuzzy_direct_hash = v.eq_ignore_ascii_case("true") || v=="1"; }
                             "direct_norm_fuzzy" => { self.direct_norm_fuzzy = v.eq_ignore_ascii_case("true") || v=="1"; }
+                            "gpu_fuzzy_mode" => {
+                                let vl = v.to_ascii_lowercase();
+                                self.fuzzy_gpu_mode = match vl.as_str() { "off"=>FuzzyGpuMode::Off, "force"=>FuzzyGpuMode::Force, _=>FuzzyGpuMode::Auto };
+                            }
                             "gpu_mem_mb" => { self.gpu_mem_mb = v.to_string(); }
                             "gpu_probe_mem_mb" => { self.gpu_probe_mem_mb = v.to_string(); }
+                            "gpu_fuzzy_prep_mem_mb" => { self.gpu_fuzzy_prep_mem_mb = v.to_string(); }
                             "ssd_storage" => { self.ssd_storage = v.eq_ignore_ascii_case("true") || v=="1"; }
                             _ => {}
                         }
@@ -579,23 +596,32 @@ impl GuiApp {
         ui.add_space(8.0);
         ui.separator();
         ui.horizontal_wrapped(|ui| {
-            ui.radio_value(&mut self.algo, MatchingAlgorithm::IdUuidYasIsMatchedInfnbd, "Algorithm 1 (first+last+birthdate)");
-            ui.radio_value(&mut self.algo, MatchingAlgorithm::IdUuidYasIsMatchedInfnmnbd, "Algorithm 2 (first+middle+last+birthdate)");
-            ui.radio_value(&mut self.algo, MatchingAlgorithm::Fuzzy, "Fuzzy (Levenshtein/Jaro/Winkler; birthdate must match)")
-                .on_hover_text("Ensemble of Levenshtein, Jaro, Jaro-Winkler; use the slider below to set the acceptance threshold.");
-            ui.radio_value(&mut self.algo, MatchingAlgorithm::FuzzyNoMiddle, "Fuzzy (first+last only; birthdate must match)")
-                .on_hover_text("Fuzzy ensemble excluding middle name. Uses first+last and requires exact birthdate equality.");
-            ui.radio_value(&mut self.algo, MatchingAlgorithm::HouseholdGpu, "Household GPU (in-memory)")
-                .on_hover_text("GPU-accelerated household matching: exact birthdate required, names fuzzy per slider; household kept if >50% members match.");
+            ui.radio_value(&mut self.algo, MatchingAlgorithm::IdUuidYasIsMatchedInfnbd, "1: Direct (first+last+birthdate)")
+                .on_hover_text("Deterministic matching: exact first and last names with exact birthdate equality. Fastest and most strict.");
+            ui.radio_value(&mut self.algo, MatchingAlgorithm::IdUuidYasIsMatchedInfnmnbd, "2: Direct (first+middle+last+birthdate)")
+                .on_hover_text("Deterministic matching: exact first, middle (optional), and last names with exact birthdate equality.");
+            ui.radio_value(&mut self.algo, MatchingAlgorithm::Fuzzy, "3: Fuzzy (Names + Exact DOB)")
+                .on_hover_text("Levenshtein/Jaro/Jaro-Winkler ensemble on names; exact birthdate equality required. Use the slider for threshold.");
+            ui.radio_value(&mut self.algo, MatchingAlgorithm::FuzzyNoMiddle, "4: Fuzzy (First+Last, Exact DOB)")
+                .on_hover_text("Fuzzy ensemble excluding middle name. Uses first+last names and requires exact birthdate equality.");
+
+            ui.radio_value(&mut self.algo, MatchingAlgorithm::HouseholdGpu, "5: Household GPU (in-memory)")
+                .on_hover_text("GPU-accelerated household matching: exact birthdate required, fuzzy per-member names; household kept if >50% members match.");
+            ui.radio_value(&mut self.algo, MatchingAlgorithm::HouseholdGpuOpt6, "6: Household GPU (Option 6: Table2→Table1)")
+                .on_hover_text("Role-swapped household matching: source=Table 2 (hh_id or id), target=Table 1 (uuid), denominator=Table 2 household size.");
         });
         ui.horizontal_wrapped(|ui| {
-            ui.checkbox(&mut self.direct_norm_fuzzy, "Apply Fuzzy-style normalization to Algorithms 1 & 2")
-                .on_hover_text("Lowercases and strips punctuation; treats hyphens as spaces. Aligns A1/A2 normalization with Fuzzy when checked.");
+            let a1a2 = matches!(self.algo, MatchingAlgorithm::IdUuidYasIsMatchedInfnbd | MatchingAlgorithm::IdUuidYasIsMatchedInfnmnbd);
+            ui.add_enabled_ui(a1a2, |ui| {
+                ui.checkbox(&mut self.direct_norm_fuzzy, "Apply Fuzzy-style normalization to Algorithms 1 & 2")
+                    .on_hover_text("Lowercases and strips punctuation; treats hyphens as spaces. Aligns A1/A2 normalization with Fuzzy when checked.");
+            });
+            if !a1a2 { ui.label("(inactive for selected algorithm)"); }
         });
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Fuzzy threshold");
-            let fuzzy_enabled = matches!(self.algo, MatchingAlgorithm::Fuzzy | MatchingAlgorithm::FuzzyNoMiddle | MatchingAlgorithm::HouseholdGpu);
+            let fuzzy_enabled = matches!(self.algo, MatchingAlgorithm::Fuzzy | MatchingAlgorithm::FuzzyNoMiddle | MatchingAlgorithm::HouseholdGpu | MatchingAlgorithm::HouseholdGpuOpt6);
             ui.add_enabled(fuzzy_enabled, egui::Slider::new(&mut self.fuzzy_threshold_pct, 60..=100).suffix(" %"));
             ui.label(format!("{}%", self.fuzzy_threshold_pct));
             if !fuzzy_enabled { ui.label("(disabled for Algorithms 1 & 2)"); }
@@ -626,24 +652,26 @@ impl GuiApp {
         ui.separator();
         ui.group(|ui| {
             ui.heading("GPU Hash Join (Algorithms 1 & 2)");
-            ui.checkbox(&mut self.use_gpu_hash_join, "Enable GPU Hash Join (A1/A2)")
-                .on_hover_text("Accelerate deterministic joins via GPU pre-hash + CPU verify; requires CUDA build; falls back automatically.");
-            if self.use_gpu_hash_join {
-                egui::Grid::new("gpu_hash_join_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                    ui.label("GPU for Build Hash:"); ui.checkbox(&mut self.use_gpu_build_hash, ""); ui.end_row();
-                    ui.label("GPU for Probe Hash:"); ui.checkbox(&mut self.use_gpu_probe_hash, ""); ui.end_row();
-                ui.checkbox(&mut self.use_gpu_fuzzy_direct_hash, "GPU pre-pass for Fuzzy direct matching")
-                    .on_hover_text("Use GPU hash filter to reduce Fuzzy candidate pairs before scoring. Exact birthdate + optional last-initial blocking; behavior preserved; CPU fallback.");
+            let a1a2 = matches!(self.algo, MatchingAlgorithm::IdUuidYasIsMatchedInfnbd | MatchingAlgorithm::IdUuidYasIsMatchedInfnmnbd);
+            ui.add_enabled_ui(a1a2, |ui| {
+                ui.checkbox(&mut self.use_gpu_hash_join, "Enable GPU Hash Join (A1/A2)")
+                    .on_hover_text("Accelerate deterministic joins via GPU pre-hash + CPU verify; requires CUDA build; falls back automatically.");
+                if self.use_gpu_hash_join {
+                    egui::Grid::new("gpu_hash_join_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                        ui.label("GPU for Build Hash:"); ui.checkbox(&mut self.use_gpu_build_hash, ""); ui.end_row();
+                        ui.label("GPU for Probe Hash:"); ui.checkbox(&mut self.use_gpu_probe_hash, ""); ui.end_row();
 
-                    ui.label("Probe GPU Mem (MB):"); ui.add(TextEdit::singleline(&mut self.gpu_probe_mem_mb).desired_width(80.0)); ui.end_row();
-                });
-                if self.gpu_total_mb > 0 {
-                    ui.label(format!("Status: Build {} | Probe {}",
-                        if self.gpu_build_active_now { "active" } else { "idle" },
-                        if self.gpu_probe_active_now { "active" } else { "idle" }
-                    ));
+                        ui.label("Probe GPU Mem (MB):"); ui.add(TextEdit::singleline(&mut self.gpu_probe_mem_mb).desired_width(80.0)); ui.end_row();
+                    });
+                    if self.gpu_total_mb > 0 {
+                        ui.label(format!("Status: Build {} | Probe {}",
+                            if self.gpu_build_active_now { "active" } else { "idle" },
+                            if self.gpu_probe_active_now { "active" } else { "idle" }
+                        ));
+                    }
                 }
-            }
+            });
+            if !a1a2 { ui.label("(inactive for selected algorithm)"); }
         });
         ui.add_space(8.0);
         ui.separator();
@@ -682,12 +710,54 @@ impl GuiApp {
                     if !cfg!(feature = "gpu") { ui.label("Note: This build was compiled without GPU feature; enable with `cargo run --features gpu`."); }
                 });
                 egui::Grid::new("gpu_accel_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                    ui.label("GPU Mem Budget (MB)"); ui.add(TextEdit::singleline(&mut self.gpu_mem_mb).desired_width(80.0)); ui.end_row();
+                    let supports_fuzzy_gpu = matches!(self.algo, MatchingAlgorithm::Fuzzy | MatchingAlgorithm::FuzzyNoMiddle | MatchingAlgorithm::HouseholdGpu | MatchingAlgorithm::HouseholdGpuOpt6);
+                    ui.label("GPU Mem Budget (MB)"); ui.add_enabled(self.use_gpu && supports_fuzzy_gpu, TextEdit::singleline(&mut self.gpu_mem_mb).desired_width(80.0)); ui.end_row();
+                    ui.label("Fuzzy GPU Metrics Mode:");
+                    ui.add_enabled_ui(self.use_gpu && supports_fuzzy_gpu, |ui| {
+                        ComboBox::from_id_source("fuzzy_gpu_mode")
+                            .selected_text(match self.fuzzy_gpu_mode { FuzzyGpuMode::Off => "Off", FuzzyGpuMode::Auto => "Auto", FuzzyGpuMode::Force => "Force" })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.fuzzy_gpu_mode, FuzzyGpuMode::Off, "Off");
+                                ui.selectable_value(&mut self.fuzzy_gpu_mode, FuzzyGpuMode::Auto, "Auto");
+                                ui.selectable_value(&mut self.fuzzy_gpu_mode, FuzzyGpuMode::Force, "Force");
+                            });
+                    });
+                    if !(self.use_gpu && supports_fuzzy_gpu) { ui.label("(inactive for selected algorithm)"); }
+                    ui.end_row();
+                    // Fuzzy GPU pre-pass control (Algorithms 3 & 4 only)
+                    let supports_fuzzy_prepass = matches!(self.algo, MatchingAlgorithm::Fuzzy | MatchingAlgorithm::FuzzyNoMiddle);
+                    let disable_reason = if matches!(self.algo, MatchingAlgorithm::IdUuidYasIsMatchedInfnbd | MatchingAlgorithm::IdUuidYasIsMatchedInfnmnbd) {
+                        "A1/A2 are deterministic; use GPU Hash Join instead"
+                    } else if matches!(self.algo, MatchingAlgorithm::HouseholdGpu | MatchingAlgorithm::HouseholdGpuOpt6) {
+                        "Household algorithm has its own GPU/CPU candidate blocking; fuzzy pre-pass is not used"
+                    } else { "" };
+                    ui.label("Fuzzy GPU Pre-pass:");
+                    ui.add_enabled_ui(self.use_gpu && supports_fuzzy_prepass, |ui| {
+                        ui.checkbox(&mut self.use_gpu_fuzzy_direct_hash, "Use GPU pre-pass for Fuzzy candidate filtering")
+                            .on_hover_text("Use GPU hash filter to reduce Fuzzy candidate pairs before scoring. Exact birthdate + optional last-initial blocking; CPU fallback.");
+                    });
+                    if !(self.use_gpu && supports_fuzzy_prepass) && !disable_reason.is_empty() {
+                        ui.label(disable_reason);
+                    }
+                    ui.end_row();
+
+                    // Dedicated VRAM for fuzzy pre-pass hashing (A3/A4)
+                    ui.label("Pre-pass VRAM (MB):");
+                    let prepass_enabled = self.use_gpu && supports_fuzzy_prepass && self.use_gpu_fuzzy_direct_hash;
+                    let resp = ui.add_enabled(prepass_enabled, TextEdit::singleline(&mut self.gpu_fuzzy_prep_mem_mb).desired_width(80.0));
+                    if !prepass_enabled {
+                        resp.on_hover_text("Enable GPU + Fuzzy pre-pass (A3/A4) to adjust this");
+                    } else {
+                        resp.on_hover_text("VRAM budget for GPU hashing during fuzzy candidate pre-pass (A3/A4)");
+                    }
+                    ui.end_row();
                 });
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Auto Optimize").on_hover_text("Detect hardware and set safe, high-performance parameters").clicked() {
                         let mem = name_matcher::metrics::memory_stats_mb();
-                        let total = mem.total_mb; let avail = mem.avail_mb;
+                        // Estimate total memory from used + available
+                        let total = mem.used_mb + mem.avail_mb;
+                        let avail = mem.avail_mb;
                         // Set streaming safety threshold: 15-20% of total RAM (min 1GB). Use 18% midpoint.
                         let mem_soft_min = ((total as f64 * 0.18) as u64).max(1024);
                         self.mem_thresh = mem_soft_min.to_string();
@@ -700,7 +770,7 @@ impl GuiApp {
                         let pool_suggestion = if total >= 32_768 { (cores.saturating_mul(4)).min(64) } else if total >= 16_384 { (cores.saturating_mul(3)).min(48) } else { (cores.saturating_mul(2)).min(32) };
                         self.pool_size = pool_suggestion.to_string();
                         // Prefer mode based on algorithm
-                        self.mode = if matches!(self.algo, MatchingAlgorithm::Fuzzy | MatchingAlgorithm::FuzzyNoMiddle | MatchingAlgorithm::HouseholdGpu) { ModeSel::InMemory } else { ModeSel::Streaming };
+                        self.mode = if matches!(self.algo, MatchingAlgorithm::Fuzzy | MatchingAlgorithm::FuzzyNoMiddle | MatchingAlgorithm::HouseholdGpu | MatchingAlgorithm::HouseholdGpuOpt6) { ModeSel::InMemory } else { ModeSel::Streaming };
                         // GPU VRAM budgeting based on currently available VRAM
                         #[cfg(feature = "gpu")]
                         {
@@ -725,8 +795,12 @@ impl GuiApp {
                                             // Probe is 25-40% of build; use ~30%
                                             let probe = ((budget as f64) * 0.30) as u64;
                                             self.gpu_probe_mem_mb = probe.clamp(256, 4096).to_string();
-                                            self.status = format!("Auto-Optimized | RAM tot {} MB, avail {} MB | Batch {} | SoftMin {} MB | Cores {} -> Pool {} | GPU free {} / tot {} MB | GPU budget {} MB, probe {} MB",
-                                                total, avail, batch, mem_soft_min, cores, pool_suggestion, free_mb, total_mb, budget, probe);
+                                            // Fuzzy pre-pass uses 20–30% of available VRAM; use ~25% here
+                                            let mut prepass = ((free_mb as f64) * 0.25) as u64;
+                                            prepass = prepass.clamp(128, 2048);
+                                            self.gpu_fuzzy_prep_mem_mb = prepass.to_string();
+                                            self.status = format!("Auto-Optimized | RAM tot {} MB, avail {} MB | Batch {} | SoftMin {} MB | Cores {} -> Pool {} | GPU free {} / tot {} MB | GPU budget {} MB, probe {} MB, prepass {} MB",
+                                                total, avail, batch, mem_soft_min, cores, pool_suggestion, free_mb, total_mb, budget, probe, prepass);
                                         } else {
                                             self.status = format!("Auto-Optimized (CUDA mem info error {:?}) | RAM tot {} MB, avail {} MB | Batch {} | SoftMin {} MB | Cores {} -> Pool {}",
                                                 rc, total, avail, batch, mem_soft_min, cores, pool_suggestion);
@@ -757,7 +831,8 @@ impl GuiApp {
                     if ui.button("Max Performance Settings").on_hover_text("Analyze hardware and apply maximum safe performance settings").clicked() {
                         // Compute and apply inline to avoid nested methods inside impl scopes
                         let mem = name_matcher::metrics::memory_stats_mb();
-                        let total = mem.total_mb; let avail = mem.avail_mb;
+                        let total = mem.used_mb + mem.avail_mb;
+                        let avail = mem.avail_mb;
                         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8) as u32;
                         let pool = if self.aggressive_recommendations { (cores.saturating_mul(6)).min(96) } else { (cores.saturating_mul(4)).min(64) };
                         self.pool_size = pool.to_string();
@@ -767,7 +842,7 @@ impl GuiApp {
                         self.batch_size = batch.to_string();
                         let soft_min = if self.aggressive_recommendations { ((total as f64 * 0.12) as u64).max(512) } else { ((total as f64 * 0.18) as u64).max(1024) };
                         self.mem_thresh = soft_min.to_string();
-                        self.mode = if matches!(self.algo, MatchingAlgorithm::Fuzzy | MatchingAlgorithm::FuzzyNoMiddle | MatchingAlgorithm::HouseholdGpu) { ModeSel::InMemory } else { ModeSel::Streaming };
+                        self.mode = if matches!(self.algo, MatchingAlgorithm::Fuzzy | MatchingAlgorithm::FuzzyNoMiddle | MatchingAlgorithm::HouseholdGpu | MatchingAlgorithm::HouseholdGpuOpt6) { ModeSel::InMemory } else { ModeSel::Streaming };
                         let mut gpu_line = String::from("GPU: not available (CPU-only build)");
                         #[cfg(feature = "gpu")]
                         {
@@ -789,7 +864,12 @@ impl GuiApp {
                                             self.gpu_mem_mb = budget.to_string();
                                             let probe = ((budget as f64) * if self.aggressive_recommendations { 0.35 } else { 0.30 }) as u64;
                                             self.gpu_probe_mem_mb = probe.clamp(256, 8192).to_string();
-                                            gpu_line = format!("GPU: free {} / total {} MB | budget {} MB | probe {} MB", free_mb, total_mb, budget, probe);
+                                            // Pre-pass VRAM: 350% of available VRAM when aggressive, else ~25%
+                                            let prepass_frac = if self.aggressive_recommendations { 0.40 } else { 0.25 };
+                                            let mut prepass = ((free_mb as f64) * prepass_frac) as u64;
+                                            prepass = prepass.clamp(128, 2048);
+                                            self.gpu_fuzzy_prep_mem_mb = prepass.to_string();
+                                            gpu_line = format!("GPU: free {} / total {} MB | budget {} MB | probe {} MB | prepass {} MB", free_mb, total_mb, budget, probe, prepass);
                                         }
                                         drop(ctx);
                                     }
@@ -816,6 +896,7 @@ impl GuiApp {
                             csv.push_str(&format!("use_gpu_probe_hash,{},\"Use GPU for probe-side hashing (A1/A2)\"\n", if self.use_gpu_probe_hash {"true"} else {"false"}));
                             csv.push_str(&format!("gpu_mem_mb,{},\"GPU memory budget for kernels\"\n", self.gpu_mem_mb));
                             csv.push_str(&format!("gpu_probe_mem_mb,{},\"GPU memory target for probe hashing batches\"\n", self.gpu_probe_mem_mb));
+                            csv.push_str(&format!("gpu_fuzzy_prep_mem_mb,{},\"VRAM for fuzzy pre-pass (A3/A4)\"\n", self.gpu_fuzzy_prep_mem_mb));
                             csv.push_str(&format!("mode,{},\"Execution mode\"\n", mode_text));
                             match std::fs::write(&filename, csv) {
                                 Ok(_) => { self.status = format!("Exported recommendations to {}", filename); }
@@ -843,6 +924,7 @@ impl GuiApp {
                                             "use_gpu_probe_hash" => self.use_gpu_probe_hash = val.eq_ignore_ascii_case("true") || val=="1",
                                             "gpu_mem_mb" => self.gpu_mem_mb = val,
                                             "gpu_probe_mem_mb" => self.gpu_probe_mem_mb = val,
+                                            "gpu_fuzzy_prep_mem_mb" => self.gpu_fuzzy_prep_mem_mb = val,
                                             "mode" => {
                                                 self.mode = match val.as_str() { "Auto"|"auto"=>ModeSel::Auto, "Streaming"|"streaming"=>ModeSel::Streaming, _=>ModeSel::InMemory };
                                             }
@@ -1014,12 +1096,15 @@ impl GuiApp {
         let use_gpu_build_hash = self.use_gpu_build_hash;
         let use_gpu_probe_hash = self.use_gpu_probe_hash;
         let gpu_probe_mem_mb_val = self.gpu_probe_mem_mb.parse::<u64>().unwrap_or(256);
+        let gpu_fuzzy_prep_mem_mb_val = self.gpu_fuzzy_prep_mem_mb.parse::<u64>().unwrap_or(256);
 
         let use_gpu_fuzzy_direct_hash = self.use_gpu_fuzzy_direct_hash;
         let direct_norm_fuzzy = self.direct_norm_fuzzy;
 
         let pool_sz = self.pool_size.parse::<u32>().unwrap_or(16);
         let batch = self.batch_size.parse::<i64>().unwrap_or(50_000);
+        let fuzzy_gpu_mode = self.fuzzy_gpu_mode;
+
 
         let fuzzy_thr: f32 = (self.fuzzy_threshold_pct as f32) / 100.0;
 
@@ -1066,8 +1151,15 @@ impl GuiApp {
                 // Apply global normalization alignment for in-memory comparators as well
                 name_matcher::matching::set_direct_normalization_fuzzy(direct_norm_fuzzy);
 
-                // Apply global GPU fuzzy pre-pass toggle (used by in-memory fuzzy)
+                // Apply global GPU fuzzy pre-pass toggle and VRAM budget (used by in-memory fuzzy)
                 name_matcher::matching::set_gpu_fuzzy_direct_prep(use_gpu_fuzzy_direct_hash);
+                name_matcher::matching::set_gpu_fuzzy_prepass_budget_mb(gpu_fuzzy_prep_mem_mb_val);
+
+                // Apply Fuzzy GPU mode to both streaming and global toggles
+                scfg.use_gpu_fuzzy_metrics = matches!(fuzzy_gpu_mode, FuzzyGpuMode::Auto | FuzzyGpuMode::Force);
+                name_matcher::matching::set_gpu_fuzzy_metrics(scfg.use_gpu_fuzzy_metrics);
+                name_matcher::matching::set_gpu_fuzzy_force(matches!(fuzzy_gpu_mode, FuzzyGpuMode::Force));
+                name_matcher::matching::set_gpu_fuzzy_disable(matches!(fuzzy_gpu_mode, FuzzyGpuMode::Off));
 
                 scfg.checkpoint_path = Some(format!("{}.nmckpt", path));
                 match fmt {
@@ -1139,10 +1231,26 @@ impl GuiApp {
 
                                 // Apply normalization alignment globally for in-memory deterministics as well
                                 name_matcher::matching::set_direct_normalization_fuzzy(direct_norm_fuzzy);
+                                // Apply GPU enhancement preset per selected algorithm to keep controls consistent
+                                name_matcher::matching::apply_gpu_enhancements_for_algo(
+                                    algo,
+                                    use_gpu_fuzzy_direct_hash,
+                                    matches!(fuzzy_gpu_mode, FuzzyGpuMode::Auto | FuzzyGpuMode::Force),
+                                    matches!(fuzzy_gpu_mode, FuzzyGpuMode::Force),
+                                    matches!(fuzzy_gpu_mode, FuzzyGpuMode::Off)
+                                );
+
 
                             if matches!(algo, MatchingAlgorithm::HouseholdGpu) {
                                 let mo = MatchOptions { backend: if use_gpu { ComputeBackend::Gpu } else { ComputeBackend::Cpu }, gpu: Some(GpuConfig { device_id: None, mem_budget_mb: gpu_mem }), progress: cfgp };
                                 let rows = match_households_gpu_inmemory(&t1, &t2, mo, fuzzy_thr, move |u| { let _ = txp.send(Msg::Progress(u)); });
+                                let mut w = HouseholdCsvWriter::create(&path)?;
+                                for r in &rows { w.write(r)?; }
+                                w.flush()?;
+                                Ok((0,0, rows.len(), path.clone()))
+                            } else if matches!(algo, MatchingAlgorithm::HouseholdGpuOpt6) {
+                                let mo = MatchOptions { backend: if use_gpu { ComputeBackend::Gpu } else { ComputeBackend::Cpu }, gpu: Some(GpuConfig { device_id: None, mem_budget_mb: gpu_mem }), progress: cfgp };
+                                let rows = match_households_gpu_inmemory_opt6(&t1, &t2, mo, fuzzy_thr, move |u| { let _ = txp.send(Msg::Progress(u)); });
                                 let mut w = HouseholdCsvWriter::create(&path)?;
                                 for r in &rows { w.write(r)?; }
                                 w.flush()?;
@@ -1160,7 +1268,7 @@ impl GuiApp {
                     }
                     FormatSel::Xlsx => {
                         let mut use_streaming = match mode { ModeSel::Streaming => true, ModeSel::InMemory => false, ModeSel::Auto => true };
-                            if matches!(algo, MatchingAlgorithm::Fuzzy | MatchingAlgorithm::FuzzyNoMiddle | MatchingAlgorithm::HouseholdGpu) { use_streaming = false; let _ = tx_for_async.send(Msg::Info("Selected algorithm uses in-memory mode (streaming disabled)".into())); }
+                            if matches!(algo, MatchingAlgorithm::Fuzzy | MatchingAlgorithm::FuzzyNoMiddle | MatchingAlgorithm::HouseholdGpu | MatchingAlgorithm::HouseholdGpuOpt6) { use_streaming = false; let _ = tx_for_async.send(Msg::Info("Selected algorithm uses in-memory mode (streaming disabled)".into())); }
                         if use_streaming {
                             let mut xw = XlsxStreamWriter::create(&path)?;
                             let mut a1 = 0usize; let mut a2 = 0usize;
@@ -1201,6 +1309,10 @@ impl GuiApp {
                             if matches!(algo, MatchingAlgorithm::HouseholdGpu) {
                                 let txp = tx_for_async.clone();
 let rows = match_households_gpu_inmemory(&t1, &t2, MatchOptions { backend: if use_gpu { ComputeBackend::Gpu } else { ComputeBackend::Cpu }, gpu: Some(GpuConfig { device_id: None, mem_budget_mb: gpu_mem }), progress: cfgp }, fuzzy_thr, move |u| { let _ = txp.send(Msg::Progress(u)); });
+                                export_households_xlsx(&path, &rows)?;
+                            } else if matches!(algo, MatchingAlgorithm::HouseholdGpuOpt6) {
+                                let txp = tx_for_async.clone();
+let rows = match_households_gpu_inmemory_opt6(&t1, &t2, MatchOptions { backend: if use_gpu { ComputeBackend::Gpu } else { ComputeBackend::Cpu }, gpu: Some(GpuConfig { device_id: None, mem_budget_mb: gpu_mem }), progress: cfgp }, fuzzy_thr, move |u| { let _ = txp.send(Msg::Progress(u)); });
                                 export_households_xlsx(&path, &rows)?;
                             } else {
                                 let txp1 = tx_for_async.clone();
@@ -1654,7 +1766,7 @@ let rows = match_households_gpu_inmemory(&t1, &t2, MatchOptions { backend: if us
                 out.push_str(&format!("System: os={} arch={} cores={} | mem_avail={} MB\n", os, arch, cores, mem.avail_mb));
                 let mode_str = match self.mode { ModeSel::Auto => "Auto", ModeSel::Streaming => "Streaming", ModeSel::InMemory => "InMemory" };
                 let fmt_str = match self.fmt { FormatSel::Csv => "CSV", FormatSel::Xlsx => "XLSX", FormatSel::Both => "Both" };
-                let algo_str = match self.algo { MatchingAlgorithm::IdUuidYasIsMatchedInfnbd => "Algo1", MatchingAlgorithm::IdUuidYasIsMatchedInfnmnbd => "Algo2", MatchingAlgorithm::Fuzzy => "Fuzzy", MatchingAlgorithm::FuzzyNoMiddle => "FuzzyNoMiddle", MatchingAlgorithm::HouseholdGpu => "Household" };
+                let algo_str = match self.algo { MatchingAlgorithm::IdUuidYasIsMatchedInfnbd => "Algo1", MatchingAlgorithm::IdUuidYasIsMatchedInfnmnbd => "Algo2", MatchingAlgorithm::Fuzzy => "Fuzzy", MatchingAlgorithm::FuzzyNoMiddle => "FuzzyNoMiddle", MatchingAlgorithm::FuzzyBirthdate => "FuzzyBirthdate", MatchingAlgorithm::HouseholdGpu => "Household5", MatchingAlgorithm::HouseholdGpuOpt6 => "Household6" };
                 out.push_str(&format!("Config: db1_host={} db1_db={} enable_dual={} pool_size={} ssd_storage={} mode={} algo={} fmt={}\n\n",
                     self.host, self.db, self.enable_dual, self.pool_size, self.ssd_storage, mode_str, algo_str, fmt_str));
                 for (i, evt) in self.error_events.iter().enumerate() {
@@ -1807,7 +1919,7 @@ let rows = match_households_gpu_inmemory(&t1, &t2, MatchOptions { backend: if us
                 out.push_str(&format!("    \"ssd_storage\": {},\n", if self.ssd_storage {"true"} else {"false"}));
                 let mode_str = match self.mode { ModeSel::Auto => "Auto", ModeSel::Streaming => "Streaming", ModeSel::InMemory => "InMemory" };
                 let fmt_str = match self.fmt { FormatSel::Csv => "CSV", FormatSel::Xlsx => "XLSX", FormatSel::Both => "Both" };
-                let algo_str = match self.algo { MatchingAlgorithm::IdUuidYasIsMatchedInfnbd => "Algo1", MatchingAlgorithm::IdUuidYasIsMatchedInfnmnbd => "Algo2", MatchingAlgorithm::Fuzzy => "Fuzzy", MatchingAlgorithm::FuzzyNoMiddle => "FuzzyNoMiddle", MatchingAlgorithm::HouseholdGpu => "Household" };
+                let algo_str = match self.algo { MatchingAlgorithm::IdUuidYasIsMatchedInfnbd => "Algo1", MatchingAlgorithm::IdUuidYasIsMatchedInfnmnbd => "Algo2", MatchingAlgorithm::Fuzzy => "Fuzzy", MatchingAlgorithm::FuzzyNoMiddle => "FuzzyNoMiddle", MatchingAlgorithm::FuzzyBirthdate => "FuzzyBirthdate", MatchingAlgorithm::HouseholdGpu => "Household5", MatchingAlgorithm::HouseholdGpuOpt6 => "Household6" };
                 out.push_str(&format!("    \"mode\": \"{}\",\n", mode_str));
                 out.push_str(&format!("    \"algo\": \"{}\",\n", algo_str));
                 out.push_str(&format!("    \"fmt\": \"{}\"\n", fmt_str));

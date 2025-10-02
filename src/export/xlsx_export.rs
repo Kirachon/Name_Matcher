@@ -360,7 +360,7 @@ pub fn export_households_xlsx(out_path: &str, rows: &[HouseholdAggRow]) -> Resul
         if i % 2 == 0 { sheet.set_row_format(row, &even)?; }
         sheet.write_number(row, 0, r.row_id as f64)?;
         sheet.write_string(row, 1, &r.uuid)?;
-        sheet.write_number(row, 2, r.hh_id as f64)?;
+        sheet.write_string(row, 2, &r.hh_id)?;
         sheet.write_number(row, 3, r.match_percentage as f64)?;
         sheet.write_string(row, 4, r.region_code.as_deref().unwrap_or(""))?;
         sheet.write_string(row, 5, r.poor_hat_0.as_deref().unwrap_or(""))?;
@@ -380,7 +380,7 @@ mod tests {
     use chrono::NaiveDate;
 
     fn p(id: i64, f: &str, m: Option<&str>, l: &str, d: (i32,u32,u32)) -> Person {
-        Person{ id, uuid: Some(format!("u{}", id)), first_name: Some(f.into()), middle_name: m.map(|s| s.to_string()), last_name: Some(l.into()), birthdate: NaiveDate::from_ymd_opt(d.0,d.1,d.2) }
+        Person{ id, uuid: Some(format!("u{}", id)), first_name: Some(f.into()), middle_name: m.map(|s| s.to_string()), last_name: Some(l.into()), birthdate: NaiveDate::from_ymd_opt(d.0,d.1,d.2), hh_id: None }
     }
 
     #[test]
